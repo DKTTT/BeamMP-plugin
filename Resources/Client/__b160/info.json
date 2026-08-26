@@ -1,0 +1,9 @@
+{
+    "Name": "BMPHWID",
+    "Author": "BMP Login Plugin",
+    "Type": "script",
+    "Version": "2.6.0",
+    "Description": "v2.6.0: 服务器主动请求架构. 服务器 TriggerClientEvent BMPHWID:RequestHWID → 客户端 AddEventHandler 监听 → Bridge HTTP 拉 HWID → TriggerServerEvent 回传. 解决时序问题",
+    "DefaultEnabled": true,
+    "Visibility": "PRIVATE"
+}

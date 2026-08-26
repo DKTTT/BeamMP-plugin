@@ -1,0 +1,59 @@
+# ============================================================
+# BeamMP BMPHWID Plugin - .gitignore
+# ============================================================
+
+# 构建产物
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+_pyi_build.log
+
+# 日志
+*.log
+*.old.log
+beamng.log
+consoleHistory.json
+
+# 敏感数据
+bmp_login/accounts.json
+bmp_login/admins.json
+bmp_login/banlist.json
+bmp_login/guest_map.json
+bmp_login/checksum.json
+bmp_login/logs/
+
+# 二进制
+*.exe
+*.dll
+*.dat
+
+# 参考代码 (不提交第三方源码)
+实例代码/
+
+# 服务端运行
+BeamMP-Server.exe
+ServerConfig.toml
+
+# 临时脚本
+fix_*.py
+recover_*.py
+final_*.py
+_fix_*.py
+_*.py
+_strip_leading_color.py
+
+# VS Code
+.vscode/
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 打包产物 (只保留 zip 源)
+!Resources/Client/BMPHWID.zip
+# 根目录旧版 (保留 Resources/Client/ 下的)
+BMPHWID.zip
