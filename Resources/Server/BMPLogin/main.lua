@@ -893,7 +893,45 @@ function _handleChat(playerID, playerName, message)
             MP.SendChatMessage(playerID, " /whoami - 查看登录状态")
             MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限 (1/5)")
             MP.SendChatMessage(playerID, " /bmpid <payload> - 客户端HWID回传")
-            
+
+        elseif cmd == "/register" then
+            local uname, pwd = args:match("^(%S+)%s+(%S+)$")
+            if uname and pwd then
+                registerAccount(playerID, uname, pwd)
+            else
+                MP.SendChatMessage(playerID, " 用法: /register <账号> <密码>")
+            end
+
+        elseif cmd == "/login" then
+            local uname, pwd = args:match("^(%S+)%s+(%S+)$")
+            if uname and pwd then
+                loginAccount(playerID, uname, pwd)
+            else
+                MP.SendChatMessage(playerID, " 用法: /login <账号> <密码>")
+            end
+
+        elseif cmd == "/logout" then
+            logoutAccount(playerID)
+
+        elseif cmd == "/whoami" then
+            local beamId = getPlayerStableInfo(playerID)
+            local role = getPlayerRole(beamId)
+            local limit = getPlayerVehicleLimit(playerID)
+            local authLabel = isPlayerAuthenticated(playerID) and "已认证" or "未认证"
+            MP.SendChatMessage(playerID, " 身份: " .. role .. "  认证状态: " .. authLabel .. "  车辆上限: " .. limit .. " 辆")
+            if beamId then
+                MP.SendChatMessage(playerID, " 绑定标识: " .. tostring(beamId))
+            end
+
+        elseif cmd == "/vehiclelimit" or cmd == "/vehicles" or cmd == "/carlimit" then
+            local limit = getPlayerVehicleLimit(playerID)
+            local authLabel = isPlayerAuthenticated(playerID) and "已认证用户" or "未认证用户"
+            MP.SendChatMessage(playerID, " 您是[" .. authLabel .. "], 车辆上限 " .. limit .. " 辆")
+
+        elseif cmd == "/bmpid" then
+            local payload = args and args:match("^%s*(.-)%s*$") or ""
+            handleBmpidCommand(playerID, playerName, payload)
+
         -- [已移除管理员命令]
 
         else
