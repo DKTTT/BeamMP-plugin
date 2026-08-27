@@ -309,7 +309,169 @@ class AdminApp:
                   font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
                   command=self._do_unban).pack(side="left", padx=4)
 
-    # ---- Tab 3: 聊天广播 ----
+    # ---- Tab 3: 在线玩家 ----
+    def _build_online_tab(self):
+        tab = tk.Frame(self.nb, bg="#f0f2f5")
+        self.nb.add(tab, text="🎮 在线玩家")
+
+        # 控制栏
+        ctrl = tk.Frame(tab, bg="#f0f2f5")
+        ctrl.pack(fill="x", padx=8, pady=4)
+
+        tk.Label(ctrl, text="踢人原因:", bg="#f0f2f5").pack(side="left", padx=4)
+        self.kick_reason = tk.Entry(ctrl, width=25)
+        self.kick_reason.insert(0, "违规行为")
+        self.kick_reason.pack(side="left", padx=4)
+
+        tk.Button(ctrl, text="🔄 刷新列表", bg="#3b82f6", fg="white",
+                  font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
+                  command=self._refresh_online).pack(side="right", padx=4)
+
+        # 在线列表
+        frm = tk.LabelFrame(tab, text="当前在线玩家 (双击行踢出, 右键拉黑)",
+                            font=("Microsoft YaHei UI", 9, "bold"),
+                            bg="#f0f2f5")
+        frm.pack(fill="both", expand=True, padx=8, pady=4)
+
+        cols = ("pid", "name", "role", "auth", "account", "beam_id", "vehicles", "online")
+        self.tv_online = ttk.Treeview(frm, columns=cols, show="headings", height=15)
+        for c, t, w in [("pid", "ID", 50), ("name", "玩家名", 120),
+                         ("role", "身份", 60), ("auth", "认证", 50),
+                         ("account", "绑定账号", 100), ("beam_id", "BeamID", 150),
+                         ("vehicles", "车辆", 50), ("online", "在线", 70)]:
+            self.tv_online.heading(c, text=t)
+            self.tv_online.column(c, width=w)
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=self.tv_online.yview)
+        self.tv_online.configure(yscrollcommand=vsb.set)
+        self.tv_online.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        vsb.pack(side="left", fill="y", pady=4)
+
+        # 绑定双击踢出
+        self.tv_online.bind("<Double-1>", lambda e: self._kick_selected())
+
+        # 操作按钮
+        btn_bar = tk.Frame(frm, bg="#f0f2f5")
+        btn_bar.pack(fill="x", pady=4)
+        tk.Button(btn_bar, text="👢 踢出选中", bg="#ef4444", fg="white",
+                  font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
+                  command=self._kick_selected).pack(side="left", padx=4)
+        tk.Button(btn_bar, text="🚫 拉黑选中", bg="#f97316", fg="white",
+                  font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
+                  command=self._ban_selected).pack(side="left", padx=4)
+
+        # 自动刷新
+        self._auto_refresh_online()
+
+    def _auto_refresh_online(self):
+        """每 5 秒自动刷新在线列表"""
+        self._refresh_online(silent=True)
+        self.after(5000, self._auto_refresh_online)
+
+    def _refresh_online(self, silent=False):
+        if not self._require_admin(silent=silent): return
+        ok, r = api_post("/api/admin/players")
+        if not ok or not r.get("ok"):
+            if not silent:
+                messagebox.showerror("错误", r.get("msg", str(r)))
+            return
+        for item in self.tv_online.get_children():
+            self.tv_online.delete(item)
+        now = int(time.time())
+        for p in r.get("data", []):
+            pid = p.get("playerID", "")
+            name = p.get("name", "")
+            role = p.get("role", "")
+            auth = "✅" if p.get("is_authenticated") else "❌"
+            acct = p.get("bind_account", "")
+            beam_id = p.get("beam_id", "")[:40]
+            veh = p.get("vehicle_count", 0)
+            jt = p.get("join_time", 0)
+            online_min = (now - jt) // 60 if jt else 0
+            online_text = f"{online_min}分" if online_min < 60 else f"{online_min // 60}时{online_min % 60}分"
+            self.tv_online.insert("", "end", values=(
+                pid, name, role, auth, acct, beam_id, veh, online_text))
+        count = len(r.get("data", []))
+        if not silent:
+            self._set_status(f"✅ 在线 {count} 人", "#10b981")
+
+    def _kick_selected(self):
+        sel = self.tv_online.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择玩家")
+            return
+        reason = self.kick_reason.get().strip() or "违规行为"
+        for s in sel:
+            vals = self.tv_online.item(s, "values")
+            pid = int(vals[0])
+            pname = vals[1]
+            if not messagebox.askyesno("确认", f"确定要踢出玩家 {pname} (ID={pid})?\n原因: {reason}"):
+                return
+            ok, r = api_post("/api/admin/kick", {"playerID": pid, "reason": reason})
+            if ok and r.get("ok"):
+                self._set_status(f"✅ {r.get('msg')}", "#10b981")
+            else:
+                messagebox.showerror("错误", r.get("msg", str(r)))
+        self._refresh_online(silent=True)
+
+    def _ban_selected(self):
+        sel = self.tv_online.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择玩家")
+            return
+        for s in sel:
+            vals = self.tv_online.item(s, "values")
+            pid = int(vals[0])
+            pname = vals[1]
+            role = vals[2]
+            auth_flag = vals[3]
+            bind_account = vals[4]
+            beam_id = vals[5]
+            
+            is_auth = (auth_flag == "✅")
+            if is_auth and bind_account:
+                # 认证玩家: 按账号封禁
+                ban_type = "account"
+                ban_value = bind_account
+                ban_desc = f"账号 {bind_account}"
+            elif beam_id and beam_id.startswith("HWID:"):
+                # 有 HWID: 按设备封禁
+                ban_type = "hwid"
+                ban_value = beam_id.split(":")[-1] if ":" in beam_id else beam_id
+                ban_desc = f"HWID {ban_value[:20]}..."
+            elif beam_id and beam_id.startswith("IP:"):
+                # 有 IP: 按 IP 封禁
+                ban_type = "ip"
+                ban_value = beam_id[3:]
+                ban_desc = f"IP {ban_value}"
+            else:
+                # 兜底: 按玩家名封禁 (游客)
+                ban_type = "name"
+                ban_value = pname
+                ban_desc = f"玩家名 {pname}"
+            
+            duration = simpledialog.askinteger("封禁时长",
+                f"封禁玩家 {pname} (ID={pid})\n类型: {ban_desc}\n\n封禁天数 (0=永久, 1-365):",
+                initialvalue=0, minvalue=0, maxvalue=365)
+            if duration is None:
+                return
+            
+            dur_text = "永久" if duration == 0 else f"{duration}天"
+            if not messagebox.askyesno("确认",
+                f"确定要拉黑 {pname}?\n类型: {ban_desc}\n时长: {dur_text}\n(3 秒内踢出)"):
+                return
+            
+            ok, r = api_post("/api/admin/ban", {
+                "type": ban_type, "value": ban_value,
+                "reason": f"管理员从在线列表拉黑 ({dur_text})",
+                "duration_days": duration
+            })
+            if ok and r.get("ok"):
+                self._set_status(f"✅ {r.get('msg')}", "#10b981")
+            else:
+                messagebox.showerror("错误", r.get("msg", str(r)))
+        self._refresh_online(silent=True)
+
+    # ---- Tab 4: 聊天广播 ----
     def _build_chat_tab(self):
         tab = tk.Frame(self.nb, bg="#f0f2f5")
         self.nb.add(tab, text="📢 聊天广播")
@@ -522,9 +684,10 @@ class AdminApp:
         self._render_stats_placeholder()
 
     # ---- 登录检查 ----
-    def _require_admin(self):
+    def _require_admin(self, silent=False):
         if not CFG.get("access_token"):
-            messagebox.showwarning("需要登录", "请先管理员登录")
+            if not silent:
+                messagebox.showwarning("需要登录", "请先管理员登录")
             return False
         return True
 

@@ -31,7 +31,7 @@
 =====================================================================
 """
 
-import re, os, sys, json, hashlib, hmac, time, threading, secrets, argparse, ipaddress
+import re, os, sys, json, hashlib, hmac, time, threading, secrets, argparse, ipaddress, uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -42,6 +42,8 @@ ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 GUESTMAP_FILE = os.path.join(DATA_DIR, "guestmap.json")
 BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
 CHAT_QUEUE_FILE = os.path.join(DATA_DIR, "chat_queue.json")
+ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
+KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
@@ -809,6 +811,13 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._admin_unban(body)
         if path == "/api/admin/banlist":
             return self._admin_banlist()
+        if path == "/api/admin/players":
+            return self._admin_players()
+        if path == "/api/admin/kick":
+            _audit_log("admin_kick", username,
+                       target=(body or {}).get("playerID", ""),
+                       detail=f"reason={(body or {}).get('reason', '')[:100]} ip={client_ip}")
+            return self._admin_kick(body)
         if path == "/api/admin/chat-queue":
             return self._admin_chat_queue()
         if path == "/api/admin/chat-queue/send":
@@ -924,14 +933,14 @@ class APIHandler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "msg": f"已解除 {target} 的绑定 {beam_id}"})
 
     def _admin_ban(self, body):
-        target_type = (body.get("type") or "").strip()  # account / hwid / ip
+        target_type = (body.get("type") or "").strip()  # account / hwid / ip / name
         target_val = (body.get("value") or "").strip()
         reason = (body.get("reason") or "").strip()
         duration_days = int(body.get("duration_days") or 0)  # 0 = 永久
         if not target_type or not target_val:
-            return self._json(400, {"ok": False, "error": "需要 type(account/hwid/ip) 和 value"})
-        if target_type not in ("account", "hwid", "ip"):
-            return self._json(400, {"ok": False, "error": "type 必须是 account/hwid/ip"})
+            return self._json(400, {"ok": False, "error": "需要 type(account/hwid/ip/name) 和 value"})
+        if target_type not in ("account", "hwid", "ip", "name"):
+            return self._json(400, {"ok": False, "error": "type 必须是 account/hwid/ip/name"})
 
         now = int(time.time())
         expires_at = now + duration_days * 86400 if duration_days > 0 else 0
@@ -939,7 +948,7 @@ class APIHandler(BaseHTTPRequestHandler):
         with FILE_LOCK:
             banlist = loadBanlist()
             # 按类型存到对应 key; 同时写 value + Lua 兼容字段名
-            if target_type == "account":
+            if target_type in ("account", "name"):
                 key = "accounts"
                 entry = {"account": target_val, "value": target_val,
                          "reason": reason, "time": now,
@@ -974,7 +983,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "需要 type 和 value"})
         with FILE_LOCK:
             banlist = loadBanlist()
-            key = "accounts" if target_type == "account" else "devices"
+            key = "accounts" if target_type in ("account", "name") else "devices"
             items = _ensure_list(banlist.get(key))
             new_items = [e for e in items
                         if (e.get("value") if isinstance(e, dict) else e) != target_val]
@@ -1013,6 +1022,46 @@ class APIHandler(BaseHTTPRequestHandler):
         all_bans = (_enrich(banlist.get("accounts"), "account") +
                     _enrich(banlist.get("devices"), "hwid/ip"))
         return self._json(200, {"ok": True, "data": all_bans})
+
+    def _admin_players(self):
+        """Return online players list (read from online_players.json)"""
+        try:
+            with FILE_LOCK:
+                data = readJsonFile(ONLINE_FILE) or []
+        except Exception:
+            data = []
+        if not isinstance(data, list):
+            data = []
+        return self._json(200, {"ok": True, "data": data})
+
+    def _admin_kick(self, body):
+        """Add a player to the kick queue (Lua polls every 3s and drops them)"""
+        player_id = (body.get("playerID") or body.get("player_id") or body.get("pid"))
+        reason = (body.get("reason") or "管理员踢出").strip()
+        if player_id is None:
+            return self._json(400, {"ok": False, "error": "需要 playerID"})
+        try:
+            player_id = int(player_id)
+        except (TypeError, ValueError):
+            return self._json(400, {"ok": False, "error": "playerID 必须是整数"})
+
+        now = int(time.time())
+        kick_entry = {
+            "id": str(uuid.uuid4()),
+            "playerID": player_id,
+            "reason": reason,
+            "time": now,
+            "done": False,
+        }
+        with FILE_LOCK:
+            queue = readJsonFile(KICK_QUEUE_FILE) or []
+            if not isinstance(queue, list):
+                queue = []
+            queue.append(kick_entry)
+            writeJsonFile(KICK_QUEUE_FILE, queue)
+
+        return self._json(200, {"ok": True,
+                                "msg": f"已添加踢人队列 #{player_id} (原因: {reason}), 3 秒内生效"})
 
     def _admin_chat_queue(self):
         try:
@@ -1165,7 +1214,7 @@ def _run_server(host, port, cfg):
 
 
 def main():
-    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS
+    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS, ONLINE_FILE, KICK_QUEUE_FILE
     p = argparse.ArgumentParser(description="BMPLogin HTTP API 服务器 (Bridge.exe 直连用)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=DEFAULT_API_PORT)
@@ -1185,6 +1234,8 @@ def main():
         ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
         GUESTMAP_FILE = os.path.join(DATA_DIR, "guestmap.json")
         BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
+        ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
+        KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
         os.makedirs(DATA_DIR, exist_ok=True)
 
     if args.admins:

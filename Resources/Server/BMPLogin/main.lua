@@ -4,11 +4,13 @@
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "2.2.0-noadmin"
+local PLUGIN_VERSION = "2.3.0-noadmin"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
 local GUEST_MAP_FILE = DATA_DIR .. "/guest_map.json"
+local ONLINE_FILE = DATA_DIR .. "/online_players.json"
+local KICK_QUEUE_FILE = DATA_DIR .. "/kick_queue.json"
 
 local accounts = {}
 local banlist = {}
@@ -551,7 +553,7 @@ end
 -- ============================================================
 local VEHICLE_LIMITS = {
     authenticated = 5,  -- 认证用户
-    unauthenticated = 1, -- 未认证用户
+    unauthenticated = 0, -- 未认证用户 (禁止刷车)
 }
 
 local function isPlayerAuthenticated(playerID)
@@ -1217,8 +1219,24 @@ function onPlayerConnected(playerID)
     local count = 0
     for _ in pairs(onlinePlayers) do count = count + 1 end
     
+    -- 写入在线玩家列表 (供 Admin GUI 读取)
+    local role = getPlayerRole(beamId, playerID)
+    local isAuth = isPlayerAuthenticated(playerID)
+    local entry = {
+        playerID = playerID,
+        name = name,
+        beam_id = beamId or "",
+        role = role,
+        is_authenticated = isAuth and true or false,
+        bind_account = (playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].bound_account) or "",
+        join_time = os.time(),
+        vehicle_count = playerVehicleCount[playerID] or 0
+    }
+    onlinePlayers[playerID] = entry
+    _saveOnlinePlayers()
+    
     -- Welcome message to public
-    MP.SendChatMessage(-1, " " .. tostring(name) .. " 加入了服务器！当前在线: " .. tostring(count) .. " 人")
+    MP.SendChatMessage(-1, " " .. tostring(name) .. " 加入了服务器！当前在线: " .. tostring(count + 1) .. " 人")
     
     -- Send guide privately
     sendWelcomeGuide(playerID, name)
@@ -1238,7 +1256,6 @@ function onPlayerConnected(playerID)
         print("[BMP Login] TriggerClientEvent 请求 HWID 失败: "..tostring(err2))
     end
     
-    local role = getPlayerRole(beamId, playerID)
     print("[BMP Login] 玩家连接: " .. tostring(name) .. " (身份: " .. role .. ")")
 
     -- 连接时立即检查封禁 (onPlayerAuth 可能漏过)
@@ -1252,60 +1269,258 @@ function onPlayerConnected(playerID)
 end
 
 function onPlayerDisconnect(playerID)
-    local name = onlinePlayers[playerID] or ("Player" .. tostring(playerID))
+    local name = (onlinePlayers[playerID] and onlinePlayers[playerID].name) or ("Player" .. tostring(playerID))
     local count = 0
     for _ in pairs(onlinePlayers) do count = count + 1 end
     if count > 0 then count = count - 1 end
 
     onlinePlayers[playerID] = nil
     playerAuthCache[playerID] = nil
-    playerVehicleCount[playerID] = nil  -- 清空车辆计数
-    pendingHwidRequests[playerID] = nil  -- 清理 HWID 请求
+    playerVehicleCount[playerID] = nil
+    pendingHwidRequests[playerID] = nil
 
+    _saveOnlinePlayers()
+    
     MP.SendChatMessage(-1, " " .. tostring(name) .. " 离开了服务器。当前在线: " .. tostring(count) .. " 人")
     print("[BMP Login] 玩家离开: " .. tostring(name))
+end
+
+-- ============================================================
+-- Online Players JSON (供 Admin GUI 读取)
+-- ============================================================
+function _saveOnlinePlayers()
+    local list = {}
+    for pid, data in pairs(onlinePlayers) do
+        table.insert(list, data)
+    end
+    writeJsonFile(ONLINE_FILE, list)
+end
+
+-- ============================================================
+-- Kick Queue Poller (API 写入 → Lua 读 → 踢人)
+-- ============================================================
+function _processKickQueue()
+    local q = readJsonFile(KICK_QUEUE_FILE)
+    if not q or type(q) ~= "table" or #q == 0 then return end
+    
+    local now = os.time()
+    local remaining = {}
+    for _, item in ipairs(q) do
+        if type(item) ~= "table" then
+            -- 无效条目, 跳过
+        elseif item.done then
+            -- 已处理的记录: 保留 1 小时内的供审计
+            if item.done_at and (now - item.done_at) <= 3600 then
+                table.insert(remaining, item)
+            end
+        else
+            -- 待处理的踢出请求
+            local pid = item.playerID
+            local reason = item.reason or "管理员踢出"
+            
+            -- 踢人
+            if pid and onlinePlayers[pid] then
+                local pname = (onlinePlayers[pid] and onlinePlayers[pid].name) or "Player" .. tostring(pid)
+                MP.SendChatMessage(-1, " [踢出] " .. tostring(pname) .. " 已被管理员踢出 (原因: " .. tostring(reason) .. ")")
+                pcall(function() MP.DropPlayer(pid, "您已被踢出: " .. tostring(reason)) end)
+                print("[BMP Login] 踢出玩家 #" .. tostring(pid) .. " 原因: " .. tostring(reason))
+            end
+            
+            -- 标记已处理
+            item.done = true
+            item.done_at = now
+            table.insert(remaining, item)
+        end
+    end
+    
+    writeJsonFile(KICK_QUEUE_FILE, remaining)
+end
+
+-- ============================================================
+-- 获取玩家所有可能的 beamId (用于封禁匹配)
+-- ============================================================
+local function getAllBeamIds(playerID)
+    local ids = {}
+    local seen = {}
+    local function add(bid)
+        if bid and type(bid) == "string" and bid ~= "" and not seen[bid] then
+            seen[bid] = true
+            table.insert(ids, bid)
+        end
+    end
+    
+    -- 1) Primary beamId from getPlayerStableInfo
+    local beamId = getPlayerStableInfo(playerID)
+    add(beamId)
+    
+    -- 2) From auth cache (onPlayerAuth)
+    if playerAuthCache and playerAuthCache[playerID] then
+        local ac = playerAuthCache[playerID]
+        add(ac.auth_beam_id)
+        -- HWID data from client plugin
+        if ac.hwid_data and type(ac.hwid_data) == "table" then
+            for k, v in pairs(ac.hwid_data) do
+                if v and type(v) == "string" and v ~= "" then
+                    add("HWID:" .. tostring(k) .. ":" .. v)
+                end
+            end
+        end
+    end
+    
+    -- 3) From MP.GetPlayerIdentifiers
+    local ok, result = pcall(function() return MP.GetPlayerIdentifiers(playerID) end)
+    if ok and result and type(result) == "table" then
+        if result.beammp and type(result.beammp) == "string" then
+            add("BEAMMP:" .. result.beammp)
+        end
+        if result.ip and type(result.ip) == "string" then
+            add("IP:" .. result.ip)
+        end
+        if result.hwid and type(result.hwid) == "string" then
+            add("HWID:srv:" .. result.hwid)
+        end
+        if result.discord and type(result.discord) == "string" then
+            add("DISCORD:" .. result.discord)
+        end
+        -- Array fallback
+        for k, v in pairs(result) do
+            if type(k) == "number" and type(v) == "string" then
+                local prefix, val = v:match("^([^:]+):(.+)$")
+                if prefix == "beammp" then add("BEAMMP:" .. val)
+                elseif prefix == "hwid" then add("HWID:srv:" .. val)
+                elseif prefix == "ip" then add("IP:" .. val)
+                end
+            end
+        end
+    end
+    
+    -- 4) Try MP.GetPlayerHWID
+    local ok2, phwid = pcall(function() return MP.GetPlayerHWID(playerID) end)
+    if ok2 and phwid and type(phwid) == "string" and phwid ~= "" then
+        add("HWID:srv:" .. phwid)
+    end
+    
+    -- 5) Player name for NAME: matching
+    local ok3, pname = pcall(function() return MP.GetPlayerName(playerID) end)
+    if ok3 and pname and type(pname) == "string" and pname ~= "" then
+        add("NAME:" .. pname)
+    end
+    
+    return ids
+end
+
+-- ============================================================
+-- 检查某个 beamId 是否匹配封禁值
+-- ============================================================
+local function beamIdMatches(beamId, ban_val, ban_type)
+    if not beamId or not ban_val or ban_val == "" then return false end
+    ban_val = tostring(ban_val)
+    
+    -- Exact match
+    if beamId == ban_val then return true end
+    
+    -- If ban_val already has a prefix (HWID:, IP:, etc.), check exact or prefix
+    if ban_val:match("^HWID:") or ban_val:match("^IP:") or ban_val:match("^BEAMMP:") or ban_val:match("^NAME:") then
+        if beamId == ban_val then return true end
+        if beamId:sub(1, #ban_val) == ban_val then return true end
+        return false
+    end
+    
+    -- No prefix in ban_val: try various prefixes
+    -- HWID match: beamId contains the value
+    if beamId:match("^HWID:") then
+        -- Extract the actual HWID from beamId (after the last colon)
+        local hwid_part = beamId:match("^HWID:[^:]+:(.+)$") or beamId:match("^HWID:(.+)$")
+        if hwid_part and (hwid_part == ban_val or hwid_part:lower() == ban_val:lower()) then
+            return true
+        end
+        -- Also check if beamId just contains the value
+        if beamId:find(ban_val, 1, true) then return true end
+    end
+    
+    -- IP match: beamId is IP:<value>
+    if beamId:match("^IP:") then
+        local ip_part = beamId:sub(4)
+        if ip_part == ban_val then return true end
+    end
+    
+    -- NAME match: beamId is NAME:<value>
+    if beamId:match("^NAME:") then
+        local name_part = beamId:sub(6)
+        if name_part == ban_val or name_part:lower() == ban_val:lower() then
+            return true
+        end
+    end
+    
+    -- Generic: beamId contains ban_val
+    if beamId:find(ban_val, 1, true) then return true end
+    
+    return false
 end
 
 -- ============================================================
 -- Ban Check & Kick (实时踢人 + 连接时检查)
 -- ============================================================
 function _checkBanAndKick(playerID)
-    if not playerID then return end
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID) or "Player" .. tostring(playerID)
-    local now = os.time()
+    if not playerID then return false end
     
-    -- 检查设备封禁 (HWID / IP)
-    if beamId then
-        for _, entry in ipairs(banlist.devices or {}) do
-            if type(entry) == "table" then
-                local exp = entry.expires_at or 0
-                if exp == 0 or exp > now then
-                    local val = entry.value or entry.device_id or entry.ip or ""
-                    if val ~= "" and (beamId == val or beamId:sub(1, #val) == val) then
-                        local reason = entry.reason or "违反服务器规则"
-                        MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (设备封禁, 原因: " .. reason .. ")")
-                        pcall(function() MP.DropPlayer(playerID, "您已被封禁: " .. reason) end)
-                        print("[BMP Login] 踢出玩家 " .. playerName .. " (设备封禁)")
-                        return true
+    local beamIds = getAllBeamIds(playerID)
+    local playerName = "Player" .. tostring(playerID)
+    local ok, pn = pcall(function() return MP.GetPlayerName(playerID) end)
+    if ok and pn and type(pn) == "string" and pn ~= "" then playerName = pn end
+    
+    local now = os.time()
+    local bound_account = nil
+    if playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].bound_account then
+        bound_account = playerAuthCache[playerID].bound_account
+    end
+    
+    -- 检查设备封禁 (HWID / IP / BEAMMP)
+    for _, entry in ipairs(banlist.devices or {}) do
+        if type(entry) == "table" then
+            local exp = entry.expires_at or 0
+            if exp == 0 or exp > now then
+                local val = entry.value or entry.device_id or entry.ip or entry.hwid or entry.beammp or ""
+                if val ~= "" then
+                    for _, bid in ipairs(beamIds) do
+                        if beamIdMatches(bid, val, "device") then
+                            local reason = entry.reason or "违反服务器规则"
+                            MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (设备封禁, 原因: " .. reason .. ")")
+                            pcall(function() MP.DropPlayer(playerID, "您已被封禁: " .. reason) end)
+                            print("[BMP Login] 踢出玩家 " .. playerName .. " (设备封禁, 匹配: " .. tostring(bid) .. " vs " .. tostring(val) .. ")")
+                            return true
+                        end
                     end
                 end
             end
         end
     end
     
-    -- 检查账号封禁
+    -- 检查账号封禁 (匹配 bound_account 或 NAME: beamId)
     for _, entry in ipairs(banlist.accounts or {}) do
         if type(entry) == "table" then
             local exp = entry.expires_at or 0
             if exp == 0 or exp > now then
                 local val = entry.value or entry.account or ""
-                if val ~= "" and beamId and beamId:find(val, 1, true) then
-                    local reason = entry.reason or "违反服务器规则"
-                    MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (账号封禁, 原因: " .. reason .. ")")
-                    pcall(function() MP.DropPlayer(playerID, "您已被封禁: " .. reason) end)
-                    print("[BMP Login] 踢出玩家 " .. playerName .. " (账号封禁)")
-                    return true
+                if val ~= "" then
+                    -- 1) Check bound_account
+                    if bound_account and bound_account == val then
+                        local reason = entry.reason or "违反服务器规则"
+                        MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (账号封禁: " .. val .. ", 原因: " .. reason .. ")")
+                        pcall(function() MP.DropPlayer(playerID, "您已被封禁 (账号: " .. val .. "), 原因: " .. reason) end)
+                        print("[BMP Login] 踢出玩家 " .. playerName .. " (账号封禁: " .. val .. ")")
+                        return true
+                    end
+                    -- 2) Check NAME: beamId
+                    for _, bid in ipairs(beamIds) do
+                        if bid:match("^NAME:") and beamIdMatches(bid, val, "account") then
+                            local reason = entry.reason or "违反服务器规则"
+                            MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (账号封禁: " .. val .. ", 原因: " .. reason .. ")")
+                            pcall(function() MP.DropPlayer(playerID, "您已被封禁 (账号: " .. val .. "), 原因: " .. reason) end)
+                            print("[BMP Login] 踢出玩家 " .. playerName .. " (账号封禁: " .. val .. ")")
+                            return true
+                        end
+                    end
                 end
             end
         end
@@ -1319,10 +1534,11 @@ local BAN_POLL_EVENT = "BMP_BAN_POLL"
 local lastBanMtime = 0
 MP.RegisterEvent(BAN_POLL_EVENT, function()
     local now = os.time()
+    
+    -- 1) Reload banlist
     local file = io.open(BANLIST_FILE, "r")
     if file then
         file:close()
-        -- 检查文件是否变化 (简单: 每次都 reload + 检查)
         local newBanlist = readJsonFile(BANLIST_FILE)
         if newBanlist then
             banlist = newBanlist
@@ -1331,10 +1547,27 @@ MP.RegisterEvent(BAN_POLL_EVENT, function()
         end
     end
     
-    -- 检查所有在线玩家是否被封禁
+    -- 2) Check all online players for bans
+    local changed = false
     for pid, _ in pairs(onlinePlayers or {}) do
-        _checkBanAndKick(pid)
+        if _checkBanAndKick(pid) then changed = true end
     end
+    
+    -- 3) Process kick queue (API → Lua → 踢人)
+    _processKickQueue()
+    
+    -- 4) Refresh online players JSON (update roles/vehicle counts)
+    for pid, data in pairs(onlinePlayers) do
+        local beamId = getPlayerStableInfo(pid)
+        data.beam_id = beamId or data.beam_id
+        data.role = getPlayerRole(beamId, pid)
+        data.is_authenticated = isPlayerAuthenticated(pid) and true or false
+        data.vehicle_count = playerVehicleCount[pid] or 0
+        if playerAuthCache and playerAuthCache[pid] and playerAuthCache[pid].bound_account then
+            data.bind_account = playerAuthCache[pid].bound_account
+        end
+    end
+    _saveOnlinePlayers()
 end)
 MP.CreateEventTimer(BAN_POLL_EVENT, 3000)  -- 每 3 秒
 
@@ -1345,21 +1578,28 @@ function onVehicleSpawn(playerID, vehicleID, vehicleData)
     -- 车辆生成事件 (3 参数: playerID, vehicleID, vehicleData)
     -- 按官方 BeamMP 文档, return 1 可取消事件 (车辆不会被生成)
 
+    local beamId = getPlayerStableInfo(playerID)
+    local role = getPlayerRole(beamId, playerID)
+    local isAuth = isPlayerAuthenticated(playerID)
+    local authLabel = getPlayerAuthLabel(playerID)
+    local limit = getPlayerVehicleLimit(playerID)
+
+    -- 未认证玩家: 禁止刷车
+    if role == "游客" or not isAuth then
+        local msg = " 您尚未登录, 无法生成车辆. 请先 /login <账号> <密码> 登录账号后即可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+        MP.SendChatMessage(playerID, msg)
+        logDebug("onVehicleSpawn 拦截游客 #" .. tostring(playerID))
+        return 1
+    end
+
     -- 当前已生成车辆数 +1 (即将生成)
     playerVehicleCount[playerID] = (playerVehicleCount[playerID] or 0) + 1
     local count = playerVehicleCount[playerID]
-    local limit = getPlayerVehicleLimit(playerID)
-    local authLabel = getPlayerAuthLabel(playerID)
 
     -- 超过限制: 取消生成
     if count > limit then
         playerVehicleCount[playerID] = count - 1  -- 回退计数 (车辆被取消)
-        local msg
-        if limit == VEHICLE_LIMITS.unauthenticated then
-            msg = " 您是[" .. authLabel .. "用户], 车辆上限 " .. limit .. " 辆, 已达上限, 生成被取消. 请先 /bmpid 发送 HWID + /login 登录账号后即可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆"
-        else
-            msg = " 您是[" .. authLabel .. "用户], 车辆上限 " .. limit .. " 辆, 已达上限, 生成被取消"
-        end
+        local msg = " 您是[" .. authLabel .. "用户], 车辆上限 " .. limit .. " 辆, 已达上限, 生成被取消"
         MP.SendChatMessage(playerID, msg)
         logDebug("onVehicleSpawn 取消 #" .. tostring(playerID) .. " 现有 " .. (count - 1) .. "/" .. limit)
         return 1  -- 取消事件 (车辆不会生成)
