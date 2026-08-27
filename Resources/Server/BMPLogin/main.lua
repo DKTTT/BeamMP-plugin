@@ -1597,7 +1597,7 @@ end
 -- Online Players JSON (供 Admin GUI 读取)
 -- ============================================================
 function _saveOnlinePlayers()
-    local list = {}
+    local list = Array({})
     for pid, data in pairs(onlinePlayers) do
         table.insert(list, data)
     end
@@ -1840,7 +1840,8 @@ end
 -- 定时轮询 banlist.json 变化 (每 3 秒) + 检查所有在线玩家
 local BAN_POLL_EVENT = "BMP_BAN_POLL"
 local lastBanMtime = 0
-MP.RegisterEvent(BAN_POLL_EVENT, function()
+
+function processBanPollGlobal(eventName)
     local now = os.time()
     
     -- 1) Reload banlist
@@ -1876,7 +1877,10 @@ MP.RegisterEvent(BAN_POLL_EVENT, function()
         end
     end
     _saveOnlinePlayers()
-end)
+    return 0
+end
+
+MP.RegisterEvent(BAN_POLL_EVENT, "processBanPollGlobal")
 MP.CreateEventTimer(BAN_POLL_EVENT, 3000)  -- 每 3 秒
 
 -- ============================================================
