@@ -18,6 +18,13 @@ local guestAccountMap = {}
 local onlinePlayers = {}
 local playerAuthCache = {}
 
+-- 投票踢出状态
+local activeVoteKick = nil   -- { target_id, initiator_id, reason, start_time, duration, votes_yes, votes_no, voted_players, last_broadcast }
+local voteKickCooldown = {}  -- initiator_id -> last vote start time
+local VOTE_KICK_DURATION = 30  -- 投票持续时间 (秒)
+local VOTE_KICK_MIN_PLAYERS = 2  -- 至少在线人数才能发起
+local VOTE_KICK_BROADCAST_INTERVAL = 5  -- 倒计时广播间隔 (秒)
+
 -- ============================================================
 -- Logging
 -- ============================================================
@@ -957,6 +964,215 @@ function onChatMessage(playerID, playerName, message)
     return 0
 end
 
+-- ============================================================
+-- 投票踢出功能
+-- ============================================================
+local function _countOnlinePlayers()
+    local count = 0
+    for _ in pairs(onlinePlayers) do count = count + 1 end
+    return count
+end
+
+local function _getOnlinePlayerName(pid)
+    local data = onlinePlayers[pid]
+    if data and data.name then return data.name end
+    local ok, pn = pcall(function() return MP.GetPlayerName(pid) end)
+    if ok and pn then return pn end
+    return "Player" .. tostring(pid)
+end
+
+local function _broadcastVoteKick(msg)
+    if msg then
+        MP.SendChatMessage(-1, " [投票] " .. msg)
+    end
+end
+
+local function _startVoteKick(initiatorID, targetID, reason)
+    -- 先统一转换为数字
+    initiatorID = tonumber(initiatorID) or initiatorID
+    targetID = tonumber(targetID) or targetID
+    
+    -- 基本检查
+    if activeVoteKick then
+        MP.SendChatMessage(initiatorID, " 已有进行中的投票, 请等待当前投票结束")
+        return false
+    end
+    if initiatorID == targetID then
+        MP.SendChatMessage(initiatorID, " 不能对自己发起投票")
+        return false
+    end
+    if not onlinePlayers[targetID] then
+        MP.SendChatMessage(initiatorID, " 目标玩家不在线或不存在")
+        return false
+    end
+    if isPlayerAdmin(targetID) then
+        MP.SendChatMessage(initiatorID, " 不能对管理员发起投票")
+        return false
+    end
+    
+    local onlineCount = _countOnlinePlayers()
+    if onlineCount < VOTE_KICK_MIN_PLAYERS then
+        MP.SendChatMessage(initiatorID, " 在线人数不足 (需要至少 " .. tostring(VOTE_KICK_MIN_PLAYERS) .. " 人)")
+        return false
+    end
+    
+    -- 冷却检查
+    local now = os.time()
+    if voteKickCooldown[initiatorID] and (now - voteKickCooldown[initiatorID]) < 120 then
+        local remain = 120 - (now - voteKickCooldown[initiatorID])
+        MP.SendChatMessage(initiatorID, " 发起人冷却中, 还需等待 " .. tostring(remain) .. " 秒")
+        return false
+    end
+    
+    local targetName = _getOnlinePlayerName(targetID)
+    
+    activeVoteKick = {
+        target_id = targetID,
+        initiator_id = initiatorID,
+        reason = reason or "未说明原因",
+        start_time = now,
+        duration = VOTE_KICK_DURATION,
+        votes_yes = 0,
+        votes_no = 0,
+        voted_players = {},
+        last_broadcast = 0,
+    }
+    voteKickCooldown[initiatorID] = now
+    
+    _broadcastVoteKick("投票踢出已发起! 目标: " .. tostring(targetName) .. " (ID:" .. tostring(targetID) .. ")")
+    _broadcastVoteKick("原因: " .. tostring(reason or "未说明"))
+    _broadcastVoteKick("在 " .. tostring(VOTE_KICK_DURATION) .. " 秒内输入 /vote yes 或 /vote no")
+    
+    return true
+end
+
+local function _handleVote(playerID, vote)
+    if not activeVoteKick then
+        MP.SendChatMessage(playerID, " 当前没有进行中的投票")
+        return
+    end
+    
+    playerID = tonumber(playerID) or playerID
+    
+    if playerID == activeVoteKick.initiator_id or playerID == activeVoteKick.target_id then
+        -- 发起者和目标玩家不能投票
+        if playerID == activeVoteKick.target_id then
+            MP.SendChatMessage(playerID, " 你是被投票目标, 不能投票")
+        else
+            MP.SendChatMessage(playerID, " 你是发起者, 不能投票")
+        end
+        return
+    end
+    
+    if activeVoteKick.voted_players[playerID] then
+        MP.SendChatMessage(playerID, " 你已经投过票了")
+        return
+    end
+    
+    local v = vote:lower()
+    if v == "yes" or v == "y" or v == "赞成" or v == "支持" then
+        activeVoteKick.votes_yes = activeVoteKick.votes_yes + 1
+        activeVoteKick.voted_players[playerID] = true
+        MP.SendChatMessage(playerID, " 你投了赞成票 (同意:" .. tostring(activeVoteKick.votes_yes) .. " 反对:" .. tostring(activeVoteKick.votes_no) .. ")")
+    elseif v == "no" or v == "n" or v == "反对" or v == "不赞成" then
+        activeVoteKick.votes_no = activeVoteKick.votes_no + 1
+        activeVoteKick.voted_players[playerID] = true
+        MP.SendChatMessage(playerID, " 你投了反对票 (同意:" .. tostring(activeVoteKick.votes_yes) .. " 反对:" .. tostring(activeVoteKick.votes_no) .. ")")
+    else
+        MP.SendChatMessage(playerID, " 投票无效, 请输入 yes 或 no")
+    end
+end
+
+local function _cancelVoteKick(reason)
+    if not activeVoteKick then return end
+    local msg = "投票已取消"
+    if reason then msg = msg .. ": " .. reason end
+    _broadcastVoteKick(msg)
+    activeVoteKick = nil
+end
+
+local function _finalizeVoteKick()
+    if not activeVoteKick then return end
+    
+    local total_voters = activeVoteKick.votes_yes + activeVoteKick.votes_no
+    local yes_pct = 0
+    if total_voters > 0 then
+        yes_pct = math.floor(activeVoteKick.votes_yes * 100 / total_voters)
+    end
+    
+    local targetID = activeVoteKick.target_id
+    local targetName = _getOnlinePlayerName(targetID)
+    local initiatorName = _getOnlinePlayerName(activeVoteKick.initiator_id)
+    local reason = activeVoteKick.reason
+    
+    _broadcastVoteKick("投票结束! 同意:" .. tostring(activeVoteKick.votes_yes) .. " 反对:" .. tostring(activeVoteKick.votes_no) .. " (赞成率:" .. tostring(yes_pct) .. "%)")
+    
+    -- 过半数赞成票则踢出
+    if activeVoteKick.votes_yes > activeVoteKick.votes_no and yes_pct > 50 then
+        _broadcastVoteKick("投票通过! " .. tostring(targetName) .. " (ID:" .. tostring(targetID) .. ") 将被踢出!")
+        _broadcastVoteKick("发起者: " .. tostring(initiatorName) .. " | 原因: " .. tostring(reason))
+        -- 执行踢出: 写入踢人队列并立即踢出
+        local queue = {}
+        local f = io.open(KICK_QUEUE_FILE, "r")
+        if f then
+            local content = f:read("*a")
+            f:close()
+            local ok, parsed = pcall(jsonDecode, content or "[]")
+            if ok and type(parsed) == "table" then
+                queue = parsed
+            end
+        end
+        local kick_entry = {
+            playerID = targetID,
+            reason = "投票踢出: " .. tostring(reason) .. " (同意:" .. tostring(activeVoteKick.votes_yes) .. " 反对:" .. tostring(activeVoteKick.votes_no) .. ")",
+            initiator = "vote",
+            timestamp = os.time(),
+            done = false,
+        }
+        table.insert(queue, kick_entry)
+        local fw = io.open(KICK_QUEUE_FILE, "w")
+        if fw then
+            fw:write(jsonEncode(queue))
+            fw:close()
+        end
+        -- 立即踢出
+        pcall(function() MP.DropPlayer(targetID, "投票踢出: " .. tostring(reason)) end)
+    else
+        _broadcastVoteKick("投票未通过, " .. tostring(targetName) .. " 不会被踢出")
+    end
+    
+    activeVoteKick = nil
+end
+
+local function _checkVoteKickTimeout()
+    if not activeVoteKick then return end
+    
+    local now = os.time()
+    local elapsed = now - activeVoteKick.start_time
+    local remaining = activeVoteKick.duration - elapsed
+    
+    -- 目标玩家已下线
+    if not onlinePlayers[activeVoteKick.target_id] then
+        _cancelVoteKick("目标玩家已离线")
+        return
+    end
+    
+    -- 倒计时广播 (每 VOTE_KICK_BROADCAST_INTERVAL 秒)
+    if now - activeVoteKick.last_broadcast >= VOTE_KICK_BROADCAST_INTERVAL and remaining > 0 then
+        activeVoteKick.last_broadcast = now
+        local targetName = _getOnlinePlayerName(activeVoteKick.target_id)
+        local msg = string.format("投票进行中: %s (ID:%d) | 赞成:%d 反对:%d | 剩余:%d秒 | 输入 /vote yes 或 /vote no",
+            tostring(targetName), activeVoteKick.target_id,
+            activeVoteKick.votes_yes, activeVoteKick.votes_no, remaining)
+        _broadcastVoteKick(msg)
+    end
+    
+    -- 时间到
+    if remaining <= 0 then
+        _finalizeVoteKick()
+    end
+end
+
 function _handleChat(playerID, playerName, message)
     
     local beamId = getPlayerStableInfo(playerID)
@@ -995,6 +1211,10 @@ function _handleChat(playerID, playerName, message)
             MP.SendChatMessage(playerID, " /whoami - 查看登录状态")
             MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限")
             MP.SendChatMessage(playerID, " /bmpid <payload> - 客户端HWID回传")
+            MP.SendChatMessage(playerID, " =========== 投票踢出 ===========")
+            MP.SendChatMessage(playerID, " /votekick <ID> [原因] - 发起投票踢出")
+            MP.SendChatMessage(playerID, " /vote <yes|no> - 参与投票")
+            MP.SendChatMessage(playerID, " /cancelvote - 取消当前投票 (管理员)")
             if isPlayerAdmin(playerID) then
                 MP.SendChatMessage(playerID, " =========== 管理员命令 ===========")
                 MP.SendChatMessage(playerID, " /listonline - 查看在线玩家列表")
@@ -1043,6 +1263,30 @@ function _handleChat(playerID, playerName, message)
         elseif cmd == "/bmpid" then
             local payload = args and args:match("^%s*(.-)%s*$") or ""
             handleBmpidCommand(playerID, playerName, payload)
+
+        -- ============ 投票踢出命令 (所有玩家可用) ============
+        elseif cmd == "/votekick" then
+            local target_id, reason = args:match("^(%d+)%s*(.*)$")
+            if not target_id then
+                MP.SendChatMessage(playerID, " 用法: /votekick <玩家ID> [原因]")
+                return
+            end
+            _startVoteKick(playerID, tonumber(target_id), reason)
+
+        elseif cmd == "/vote" then
+            local vote = args:match("^(%S+)")
+            if not vote then
+                MP.SendChatMessage(playerID, " 用法: /vote <yes|no>")
+                return
+            end
+            _handleVote(playerID, vote)
+
+        elseif cmd == "/cancelvote" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            _cancelVoteKick("管理员终止")
 
         -- ============ 管理员命令 ============
         elseif cmd == "/listonline" then
@@ -1584,6 +1828,15 @@ function onPlayerDisconnect(playerID)
     for _ in pairs(onlinePlayers) do count = count + 1 end
     if count > 0 then count = count - 1 end
 
+    -- 投票踢出清理: 如果断开的玩家是投票目标或发起者, 取消投票
+    if activeVoteKick then
+        if activeVoteKick.target_id == playerID then
+            _cancelVoteKick("目标玩家已离线")
+        elseif activeVoteKick.initiator_id == playerID then
+            _cancelVoteKick("发起者已离线")
+        end
+    end
+
     onlinePlayers[playerID] = nil
     playerAuthCache[playerID] = nil
     playerVehicleCount[playerID] = nil
@@ -1877,6 +2130,9 @@ function processBanPollGlobal(eventName)
     
     -- 3) Process kick queue (API → Lua → 踢人)
     _processKickQueue()
+    
+    -- 3.5) Vote kick timeout check
+    _checkVoteKickTimeout()
     
     -- 4) Refresh online players JSON (update roles/vehicle counts)
     for pid, data in pairs(onlinePlayers) do
