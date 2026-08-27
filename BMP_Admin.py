@@ -366,7 +366,7 @@ class AdminApp:
     def _auto_refresh_online(self):
         """每 5 秒自动刷新在线列表"""
         self._refresh_online(silent=True)
-        self.after(5000, self._auto_refresh_online)
+        self.root.after(5000, self._auto_refresh_online)
 
     def _refresh_online(self, silent=False):
         if not self._require_admin(silent=silent): return
