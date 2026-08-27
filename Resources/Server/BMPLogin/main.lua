@@ -896,13 +896,12 @@ local function loginAccount(playerID, username, password)
 end
 
 local function logoutAccount(playerID)
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID)
-    local role = getPlayerRole(beamId, playerID)
+    if not isPlayerAuthenticated(playerID) then
         MP.SendChatMessage(playerID, " 你当前未登录任何账号")
         return
     end
     
+    local playerName = MP.GetPlayerName(playerID)
     MP.SendChatMessage(playerID, " 已退出登录")
     logMsg("玩家 " .. tostring(playerName) .. " 退出了登录")
 end
