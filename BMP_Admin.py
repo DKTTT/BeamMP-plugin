@@ -176,6 +176,7 @@ class AdminApp:
         self.nb.pack(fill="both", expand=True, padx=8, pady=4)
 
         self._build_accounts_tab()
+        self._build_online_tab()
         self._build_ban_tab()
         self._build_chat_tab()
         self._build_stats_tab()
