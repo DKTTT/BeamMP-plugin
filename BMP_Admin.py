@@ -265,16 +265,22 @@ class AdminApp:
         self.ban_type.grid(row=0, column=1, padx=4, pady=4, sticky="w")
 
         tk.Label(frm1, text="值:", bg="#f0f2f5").grid(row=0, column=2, padx=4, pady=4, sticky="e")
-        self.ban_val = tk.Entry(frm1, width=30)
+        self.ban_val = tk.Entry(frm1, width=20)
         self.ban_val.grid(row=0, column=3, padx=4, pady=4)
 
-        tk.Label(frm1, text="原因:", bg="#f0f2f5").grid(row=0, column=4, padx=4, pady=4, sticky="e")
-        self.ban_reason = tk.Entry(frm1, width=25)
-        self.ban_reason.grid(row=0, column=5, padx=4, pady=4)
+        tk.Label(frm1, text="天数:", bg="#f0f2f5").grid(row=0, column=4, padx=4, pady=4, sticky="e")
+        self.ban_days = tk.Entry(frm1, width=6)
+        self.ban_days.insert(0, "0")
+        self.ban_days.grid(row=0, column=5, padx=4, pady=4, sticky="w")
+        tk.Label(frm1, text="(0=永久)", bg="#f0f2f5", fg="#94a3b8").grid(row=0, column=6, padx=2, pady=4, sticky="w")
+
+        tk.Label(frm1, text="原因:", bg="#f0f2f5").grid(row=1, column=0, padx=4, pady=4, sticky="e")
+        self.ban_reason = tk.Entry(frm1, width=30)
+        self.ban_reason.grid(row=1, column=1, padx=4, pady=4, columnspan=3, sticky="w")
 
         tk.Button(frm1, text="🚫 封禁", bg="#ef4444", fg="white",
                   font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
-                  command=self._do_ban).grid(row=0, column=6, padx=8, pady=4)
+                  command=self._do_ban).grid(row=1, column=4, padx=8, pady=4, columnspan=2)
 
         # 封禁列表
         frm2 = tk.LabelFrame(tab, text="当前封禁列表",
@@ -282,10 +288,11 @@ class AdminApp:
                               bg="#f0f2f5")
         frm2.pack(fill="both", expand=True, padx=8, pady=4)
 
-        cols2 = ("type", "value", "reason", "time")
+        cols2 = ("type", "value", "reason", "expires", "time")
         self.tv_ban = ttk.Treeview(frm2, columns=cols2, show="headings", height=12)
-        for c, t, w in [("type", "类型", 80), ("value", "值", 200),
-                         ("reason", "原因", 250), ("time", "时间", 150)]:
+        for c, t, w in [("type", "类型", 70), ("value", "值", 180),
+                         ("reason", "原因", 200), ("expires", "到期", 100),
+                         ("time", "时间", 130)]:
             self.tv_ban.heading(c, text=t)
             self.tv_ban.column(c, width=w)
         vsb2 = ttk.Scrollbar(frm2, orient="vertical", command=self.tv_ban.yview)
@@ -715,18 +722,29 @@ class AdminApp:
             return
         for item in self.tv_ban.get_children():
             self.tv_ban.delete(item)
-        data = r.get("data", {})
-        for key, label in [("accounts", "account"), ("devices", "hwid/ip")]:
-            for entry in data.get(key, []):
-                if isinstance(entry, dict):
-                    val = entry.get("value", "")
-                    reason = entry.get("reason", "")
-                    t = fmt_time(entry.get("time"))
+        data = r.get("data", [])
+        if isinstance(data, list):
+            for entry in data:
+                typ = entry.get("type", "")
+                val = entry.get("value", "")
+                reason = entry.get("reason", "")
+                dur = entry.get("duration_days", 0)
+                exp = entry.get("expires_at", 0)
+                expired = entry.get("expired", False)
+                if expired:
+                    exp_text = "已过期"
+                elif exp > 0:
+                    remain = entry.get("remaining_seconds", 0)
+                    if remain > 86400:
+                        exp_text = f"{remain // 86400}天"
+                    elif remain > 3600:
+                        exp_text = f"{remain // 3600}小时"
+                    else:
+                        exp_text = f"{remain // 60}分钟"
                 else:
-                    val = str(entry)
-                    reason = ""
-                    t = ""
-                self.tv_ban.insert("", "end", values=(label, val, reason, t))
+                    exp_text = "永久"
+                t = fmt_time(entry.get("time"))
+                self.tv_ban.insert("", "end", values=(typ, val, reason, exp_text, t))
         self._set_status(f"✅ 封禁列表已加载", "#10b981")
 
     def _do_ban(self):
@@ -734,13 +752,20 @@ class AdminApp:
         t = self.ban_type.get()
         v = self.ban_val.get().strip()
         reason = self.ban_reason.get().strip()
+        try:
+            days = int(self.ban_days.get().strip() or "0")
+        except ValueError:
+            days = 0
         if not v:
             messagebox.showwarning("提示", "请填写封禁值")
             return
-        ok, r = api_post("/api/admin/ban", {"type": t, "value": v, "reason": reason})
+        body = {"type": t, "value": v, "reason": reason, "duration_days": days}
+        ok, r = api_post("/api/admin/ban", body)
         if ok and r.get("ok"):
             self.ban_val.delete(0, "end")
             self.ban_reason.delete(0, "end")
+            self.ban_days.delete(0, "end")
+            self.ban_days.insert(0, "0")
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_ban()
         else:

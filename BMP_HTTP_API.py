@@ -927,26 +927,45 @@ class APIHandler(BaseHTTPRequestHandler):
         target_type = (body.get("type") or "").strip()  # account / hwid / ip
         target_val = (body.get("value") or "").strip()
         reason = (body.get("reason") or "").strip()
+        duration_days = int(body.get("duration_days") or 0)  # 0 = 永久
         if not target_type or not target_val:
             return self._json(400, {"ok": False, "error": "需要 type(account/hwid/ip) 和 value"})
         if target_type not in ("account", "hwid", "ip"):
             return self._json(400, {"ok": False, "error": "type 必须是 account/hwid/ip"})
+
+        now = int(time.time())
+        expires_at = now + duration_days * 86400 if duration_days > 0 else 0
+
         with FILE_LOCK:
             banlist = loadBanlist()
-            key = target_type + "s"  # accounts / devices (复用 devices 存 hwid 和 ip)
+            # 按类型存到对应 key; 同时写 value + Lua 兼容字段名
             if target_type == "account":
                 key = "accounts"
+                entry = {"account": target_val, "value": target_val,
+                         "reason": reason, "time": now,
+                         "duration_days": duration_days, "expires_at": expires_at}
             else:
                 key = "devices"
-            entry = {"value": target_val, "reason": reason, "time": int(time.time())}
+                if target_type == "hwid":
+                    entry = {"device_id": target_val, "value": target_val,
+                             "reason": reason, "time": now,
+                             "duration_days": duration_days, "expires_at": expires_at}
+                else:  # ip
+                    entry = {"ip": target_val, "value": target_val,
+                             "reason": reason, "time": now,
+                             "duration_days": duration_days, "expires_at": expires_at}
             banlist[key] = _ensure_list(banlist.get(key))
-            # 避免重复
+            # 避免重复 (删旧的)
             existing_values = [e.get("value") if isinstance(e, dict) else e
                                for e in banlist[key]]
-            if target_val not in existing_values:
-                banlist[key].append(entry)
+            banlist[key] = [e for e in banlist[key]
+                           if (e.get("value") if isinstance(e, dict) else e) != target_val]
+            banlist[key].append(entry)
             writeJsonFile(BANLIST_FILE, banlist)
-        return self._json(200, {"ok": True, "msg": f"已封禁 {target_type}:{target_val}"})
+
+        dur_text = f"{duration_days} 天" if duration_days > 0 else "永久"
+        return self._json(200, {"ok": True,
+                                "msg": f"已封禁 {target_type}:{target_val} ({dur_text})"})
 
     def _admin_unban(self, body):
         target_type = (body.get("type") or "").strip()
@@ -964,9 +983,36 @@ class APIHandler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "msg": f"已解封 {target_type}:{target_val}"})
 
     def _admin_banlist(self):
+        now = int(time.time())
         with FILE_LOCK:
             banlist = loadBanlist()
-        return self._json(200, {"ok": True, "data": banlist})
+
+        def _enrich(items, kind):
+            result = []
+            for e in _ensure_list(items):
+                if not isinstance(e, dict):
+                    continue
+                exp = e.get("expires_at", 0) or 0
+                expired = exp > 0 and exp <= now
+                remaining = 0
+                if exp > 0 and not expired:
+                    remaining = exp - now
+                val = e.get("value") or e.get("account") or e.get("device_id") or e.get("ip", "")
+                result.append({
+                    "type": kind,
+                    "value": val,
+                    "reason": e.get("reason", ""),
+                    "time": e.get("time", 0),
+                    "duration_days": e.get("duration_days", 0),
+                    "expires_at": exp,
+                    "expired": expired,
+                    "remaining_seconds": remaining,
+                })
+            return result
+
+        all_bans = (_enrich(banlist.get("accounts"), "account") +
+                    _enrich(banlist.get("devices"), "hwid/ip"))
+        return self._json(200, {"ok": True, "data": all_bans})
 
     def _admin_chat_queue(self):
         try:

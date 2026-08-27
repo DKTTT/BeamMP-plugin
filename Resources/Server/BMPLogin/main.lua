@@ -1104,20 +1104,34 @@ function onPlayerAuth(player_name, role, isGuest, identifiers)
     print("[BMP Login] onPlayerAuth: " .. tostring(player_name) .. " | role=" .. tostring(role) .. " | isGuest=" .. tostring(isGuest) .. " | RAW[" .. (raw ~= "" and raw:sub(2) or "") .. "]")
     print("[BMP Login] onPlayerAuth: parsed beam_id=" .. tostring(beamId) .. " | ip=" .. tostring(ip))
     
-    -- Check device ban
+    -- Check device ban (hwid / ip)
     if beamId then
         for _, entry in ipairs(banlist.devices or {}) do
-            if entry.device_id and beamId == entry.device_id then
-                return "该设备已被封禁"
+            if type(entry) == "table" then
+                local exp = entry.expires_at or 0
+                if exp == 0 or exp > os.time() then
+                    local val = entry.value or entry.device_id or entry.ip or ""
+                    if val ~= "" and (beamId == val or beamId:sub(1, #val) == val) then
+                        local remain = exp > 0 and math.ceil((exp - os.time()) / 86400) or 0
+                        local dur_text = exp > 0 and ("剩余 " .. remain .. " 天") or "永久"
+                        return "该设备已被封禁 (" .. dur_text .. "), 原因: " .. tostring(entry.reason or "")
+                    end
+                end
             end
         end
     end
     
-    -- Check account ban by IP
-    if ip then
-        for _, entry in ipairs(banlist.accounts or {}) do
-            if entry.ip and ip == entry.ip then
-                return "该IP已被封禁"
+    -- Check account ban (by beam_id or player name matching)
+    for _, entry in ipairs(banlist.accounts or {}) do
+        if type(entry) == "table" then
+            local exp = entry.expires_at or 0
+            if exp == 0 or exp > os.time() then
+                local val = entry.value or entry.account or ""
+                if val ~= "" and beamId and beamId:find(val, 1, true) then
+                    local remain = exp > 0 and math.ceil((exp - os.time()) / 86400) or 0
+                    local dur_text = exp > 0 and ("剩余 " .. remain .. " 天") or "永久"
+                    return "该账号已被封禁 (" .. dur_text .. "), 原因: " .. tostring(entry.reason or "")
+                end
             end
         end
     end
@@ -1227,6 +1241,12 @@ function onPlayerConnected(playerID)
     local role = getPlayerRole(beamId, playerID)
     print("[BMP Login] 玩家连接: " .. tostring(name) .. " (身份: " .. role .. ")")
 
+    -- 连接时立即检查封禁 (onPlayerAuth 可能漏过)
+    local kicked = _checkBanAndKick(playerID)
+    if kicked then
+        return  -- 已被踢出, 不执行后续逻辑
+    end
+
     -- 兜底: 玩家进服也顺便 poll 一次 Bridge 聊天队列 (之前累积的消息立即出)
     _tryPollChatQueue()
 end
@@ -1245,6 +1265,78 @@ function onPlayerDisconnect(playerID)
     MP.SendChatMessage(-1, " " .. tostring(name) .. " 离开了服务器。当前在线: " .. tostring(count) .. " 人")
     print("[BMP Login] 玩家离开: " .. tostring(name))
 end
+
+-- ============================================================
+-- Ban Check & Kick (实时踢人 + 连接时检查)
+-- ============================================================
+function _checkBanAndKick(playerID)
+    if not playerID then return end
+    local beamId = getPlayerStableInfo(playerID)
+    local playerName = MP.GetPlayerName(playerID) or "Player" .. tostring(playerID)
+    local now = os.time()
+    
+    -- 检查设备封禁 (HWID / IP)
+    if beamId then
+        for _, entry in ipairs(banlist.devices or {}) do
+            if type(entry) == "table" then
+                local exp = entry.expires_at or 0
+                if exp == 0 or exp > now then
+                    local val = entry.value or entry.device_id or entry.ip or ""
+                    if val ~= "" and (beamId == val or beamId:sub(1, #val) == val) then
+                        local reason = entry.reason or "违反服务器规则"
+                        MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (设备封禁, 原因: " .. reason .. ")")
+                        pcall(function() MP.DropPlayer(playerID, "您已被封禁: " .. reason) end)
+                        print("[BMP Login] 踢出玩家 " .. playerName .. " (设备封禁)")
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    
+    -- 检查账号封禁
+    for _, entry in ipairs(banlist.accounts or {}) do
+        if type(entry) == "table" then
+            local exp = entry.expires_at or 0
+            if exp == 0 or exp > now then
+                local val = entry.value or entry.account or ""
+                if val ~= "" and beamId and beamId:find(val, 1, true) then
+                    local reason = entry.reason or "违反服务器规则"
+                    MP.SendChatMessage(-1, " [封禁] " .. playerName .. " 已被踢出 (账号封禁, 原因: " .. reason .. ")")
+                    pcall(function() MP.DropPlayer(playerID, "您已被封禁: " .. reason) end)
+                    print("[BMP Login] 踢出玩家 " .. playerName .. " (账号封禁)")
+                    return true
+                end
+            end
+        end
+    end
+    
+    return false
+end
+
+-- 定时轮询 banlist.json 变化 (每 3 秒) + 检查所有在线玩家
+local BAN_POLL_EVENT = "BMP_BAN_POLL"
+local lastBanMtime = 0
+MP.RegisterEvent(BAN_POLL_EVENT, function()
+    local now = os.time()
+    local file = io.open(BANLIST_FILE, "r")
+    if file then
+        file:close()
+        -- 检查文件是否变化 (简单: 每次都 reload + 检查)
+        local newBanlist = readJsonFile(BANLIST_FILE)
+        if newBanlist then
+            banlist = newBanlist
+            if not banlist.accounts then banlist.accounts = Array({}) end
+            if not banlist.devices then banlist.devices = Array({}) end
+        end
+    end
+    
+    -- 检查所有在线玩家是否被封禁
+    for pid, _ in pairs(onlinePlayers or {}) do
+        _checkBanAndKick(pid)
+    end
+end)
+MP.CreateEventTimer(BAN_POLL_EVENT, 3000)  -- 每 3 秒
 
 -- ============================================================
 -- Vehicle Events (minimal)
