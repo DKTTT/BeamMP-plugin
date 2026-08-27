@@ -375,6 +375,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._chat_queue(getattr(self, "_auth_cache", None))
         if path == "/api/players/names":
             return self._players_names()
+        if path == "/api/vote/status":
+            return self._vote_status()
         self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
@@ -430,9 +432,6 @@ class APIHandler(BaseHTTPRequestHandler):
         # ---- /api/vote/cast (Bridge 投票) ----
         if path == "/api/vote/cast":
             return self._vote_cast(body)
-        # ---- /api/vote/status (Bridge 查看投票状态) ----
-        if path == "/api/vote/status":
-            return self._vote_status()
 
         # ---- 管理员 API ----
         if path.startswith("/api/admin/"):
