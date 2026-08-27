@@ -527,9 +527,15 @@ end
 -- ============================================================
 -- Player Role
 -- ============================================================
-local function getPlayerRole(beamId)
+local function getPlayerRole(beamId, playerID)
     if not beamId then return "游客" end
+    -- 方法 1: accounts 直接以 beamId 为 key (老格式)
     if accounts[beamId] then return "玩家" end
+    -- 方法 2: 通过 playerAuthCache.bound_account 检查 (登录后绑定)
+    if playerID and playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].bound_account then
+        local uname = playerAuthCache[playerID].bound_account
+        if uname and accounts[uname] then return "玩家" end
+    end
     return "游客"
 end
 
@@ -843,9 +849,7 @@ end
 local function logoutAccount(playerID)
     local beamId = getPlayerStableInfo(playerID)
     local playerName = MP.GetPlayerName(playerID)
-    local role = getPlayerRole(beamId)
-    
-    if role == "游客" then
+    local role = getPlayerRole(beamId, playerID)
         MP.SendChatMessage(playerID, " 你当前未登录任何账号")
         return
     end
@@ -906,7 +910,7 @@ end
 function _handleChat(playerID, playerName, message)
     
     local beamId = getPlayerStableInfo(playerID)
-    local role = getPlayerRole(beamId)
+    local role = getPlayerRole(beamId, playerID)
     local prefix = "" .. playerName .. ": "
     
     -- Guest reminder
@@ -952,7 +956,7 @@ function _handleChat(playerID, playerName, message)
 
         elseif cmd == "/whoami" then
             local beamId = getPlayerStableInfo(playerID)
-            local role = getPlayerRole(beamId)
+            local role = getPlayerRole(beamId, playerID)
             local limit = getPlayerVehicleLimit(playerID)
             local authLabel = isPlayerAuthenticated(playerID) and "已认证" or "未认证"
             MP.SendChatMessage(playerID, " 身份: " .. role .. "  认证状态: " .. authLabel .. "  车辆上限: " .. limit .. " 辆")
@@ -1220,7 +1224,7 @@ function onPlayerConnected(playerID)
         print("[BMP Login] TriggerClientEvent 请求 HWID 失败: "..tostring(err2))
     end
     
-    local role = getPlayerRole(beamId)
+    local role = getPlayerRole(beamId, playerID)
     print("[BMP Login] 玩家连接: " .. tostring(name) .. " (身份: " .. role .. ")")
 
     -- 兜底: 玩家进服也顺便 poll 一次 Bridge 聊天队列 (之前累积的消息立即出)
