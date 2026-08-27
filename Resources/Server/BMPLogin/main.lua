@@ -1,18 +1,16 @@
 -- ============================================================
--- BMP Login Plugin v2.1.0 (Clean Rebuild)
+-- BMP Login Plugin v2.2.0 (无管理员版·由认证器写入)
 -- BeamMP Server Player Account Management
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "2.1.0"
+local PLUGIN_VERSION = "2.2.0-noadmin"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
-local ADMINS_FILE = DATA_DIR .. "/admins.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
 local GUEST_MAP_FILE = DATA_DIR .. "/guest_map.json"
 
 local accounts = {}
-local admins = {}
 local banlist = {}
 local guestAccountMap = {}
 local onlinePlayers = {}
@@ -310,6 +308,100 @@ local function writeJsonFile(filePath, data)
 end
 
 -- ============================================================
+-- Bridge 聊天 → 公屏广播 (1Hz 轮询)
+--   流程: Bridge GUI Tab3 聊天框 → POST /api/chat/send
+--         → BMP_HTTP_API.py 写 bmp_login/chat_queue.json
+--         → MP.CreateEventTimer(BMP_CHAT_QUEUE_POLL, 1000) 1Hz 轮询
+--         → MP.SendChatMessage(-1, "[Bridge:账号] 显示名: 消息")
+--   ⚠️ 此模块必须放在 jsonEncode/jsonDecode/writeJsonFile 之后定义
+--   ⚠️ 并且 processChatQueueGlobal 必须是全局函数 (MP.RegisterEvent 要求)
+-- ============================================================
+local CHAT_QUEUE_FILE = DATA_DIR .. "/chat_queue.json"
+local lastChatQueuePoll = 0
+local CHAT_QUEUE_INTERVAL = 1   -- 秒 (文件轮询节流; CreateEventTimer 本身就是 1Hz)
+
+local function sanitizeChatText(s)
+    s = tostring(s or "")
+    s = s:gsub("[%z\1-\31]", "")
+    if #s > 200 then s = s:sub(1, 200) .. "..." end
+    return s
+end
+
+local function processChatQueueInternal()
+    local now = os.time()
+    if now - lastChatQueuePoll < CHAT_QUEUE_INTERVAL then return end
+    lastChatQueuePoll = now
+
+    local f = io.open(CHAT_QUEUE_FILE, "r")
+    if not f then return end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return end
+
+    local ok_parse, queue = pcall(jsonDecode, content)
+    if not ok_parse or type(queue) ~= "table" then return end
+
+    local pending = {}
+    local remaining = {}
+    for _, item in ipairs(queue) do
+        if type(item) == "table" then
+            if item.sent then
+                if #remaining < 50 then
+                    table.insert(remaining, item)
+                end
+            else
+                table.insert(pending, item)
+            end
+        end
+    end
+
+    if #pending == 0 then return end
+
+    -- 广播 pending 消息给所有在线玩家
+    for _, item in ipairs(pending) do
+        local name = sanitizeChatText(item.name or "guest")
+        if #name > 16 then name = name:sub(1, 16) end
+        local text = sanitizeChatText(item.text or "")
+        local prefix = "[Bridge]"
+        if item.username and item.username ~= "" then
+            prefix = "[Bridge:" .. tostring(item.username) .. "]"
+        end
+        local msg = " " .. prefix .. " " .. name .. ": " .. text
+        pcall(function() MP.SendChatMessage(-1, msg) end)
+        item.sent = true
+        item.sent_ts = os.time()
+        print("[BMP Login] [ChatQueue] broadcast: " .. msg)
+    end
+
+    -- 写回 (合并 + 限制 100 条)
+    local new_queue = {}
+    for _, item in ipairs(remaining) do
+        if #new_queue < 100 then table.insert(new_queue, item) end
+    end
+    for _, item in ipairs(pending) do
+        if #new_queue < 100 then table.insert(new_queue, item) end
+    end
+
+    local f2 = io.open(CHAT_QUEUE_FILE, "w")
+    if f2 then
+        f2:write(jsonEncode(new_queue))
+        f2:close()
+    end
+end
+
+-- ⚠️ BeamMP MP.RegisterEvent 要求: 函数名必须 **全局 (_G 可找到)**
+-- 同时 CreateEventTimer 的回调签名是 (event_name:string)
+function processChatQueueGlobal(eventName)
+    pcall(processChatQueueInternal)
+    return 0
+end
+
+-- 兜底: 玩家发消息 / 进服 时也顺便 poll 一次 (哪怕 timer 坏了也能出)
+function _tryPollChatQueue()
+    pcall(processChatQueueInternal)
+end
+
+-- ============================================================
 -- Data Loading / Saving
 -- ============================================================
 local function loadAccounts()
@@ -390,15 +482,6 @@ local function saveAccounts()
     writeJsonFile(ACCOUNTS_FILE, accounts)
 end
 
-local function loadAdmins()
-    local data = readJsonFile(ADMINS_FILE)
-    if data then admins = data else admins = {} end
-    print("[BMP Login] 管理员数量: " .. #admins)
-end
-
-local function saveAdmins()
-    writeJsonFile(ADMINS_FILE, admins)
-end
 
 local function loadBanlist()
     local data = readJsonFile(BANLIST_FILE)
@@ -434,20 +517,10 @@ end
 -- ============================================================
 local function getPlayerRole(beamId)
     if not beamId then return "游客" end
-    for _, admin in ipairs(admins) do
-        if admin.beam_id == beamId then return "管理员" end
-    end
     if accounts[beamId] then return "玩家" end
     return "游客"
 end
 
-local function isAdmin(beamId)
-    if not beamId then return false end
-    for _, admin in ipairs(admins) do
-        if admin.beam_id == beamId then return true end
-    end
-    return false
-end
 
 -- ============================================================
 -- 认证用户判定 (基于稳定 HWID)
@@ -457,10 +530,8 @@ end
 -- 车辆数量限制:
 --   认证用户: 5 辆 (机器码已绑定, 可信任)
 --   未认证用户: 1 辆 (无稳定身份, 防滥用)
---   管理员: 无限制
 -- ============================================================
 local VEHICLE_LIMITS = {
-    admin = 999,        -- 管理员无限制
     authenticated = 5,  -- 认证用户
     unauthenticated = 1, -- 未认证用户
 }
@@ -493,9 +564,6 @@ end
 local function getPlayerVehicleLimit(playerID)
     if not playerID then return VEHICLE_LIMITS.unauthenticated end
     local beam_id_ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
-    if beam_id_ok and beam_id and isAdmin(beam_id) then
-        return VEHICLE_LIMITS.admin
-    end
     if isPlayerAuthenticated(playerID) then
         return VEHICLE_LIMITS.authenticated
     end
@@ -505,7 +573,6 @@ end
 local function getPlayerAuthLabel(playerID)
     if not playerID then return "未认证" end
     local beam_id_ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
-    if beam_id_ok and beam_id and isAdmin(beam_id) then return "管理员" end
     if isPlayerAuthenticated(playerID) then return "认证" end
     return "未认证"
 end
@@ -513,13 +580,6 @@ end
 -- per-player 当前车辆数 (playerID -> count)
 local playerVehicleCount = {}
 
-local function getAdminLevel(beamId)
-    if not beamId then return 0 end
-    for _, admin in ipairs(admins) do
-        if admin.beam_id == beamId then return admin.level or 1 end
-    end
-    return 0
-end
 
 -- ============================================================
 -- Player Stable Info (HWID)
@@ -772,179 +832,17 @@ local function logoutAccount(playerID)
     logMsg("玩家 " .. tostring(playerName) .. " 退出了登录")
 end
 
--- ============================================================
--- Admin Commands
--- ============================================================
-local function addAdmin(playerID, targetName, level)
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID)
-    
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    level = level or 1
-    for _, admin in ipairs(admins) do
-        if admin.username == targetName then
-            admin.level = level
-            saveAdmins()
-            MP.SendChatMessage(playerID, " 已更新管理员 " .. targetName .. " 的权限等级为 " .. level)
-            return
-        end
-    end
-    
-    local targetBeamId = nil
-    if accounts[targetName] then
-        local bindings = accounts[targetName].bind_beam_ids or {}
-        targetBeamId = bindings[1]
-    end
-    
-    admins[#admins + 1] = {
-        username = targetName,
-        beam_id = targetBeamId or "PENDING:" .. targetName,
-        level = level
-    }
-    saveAdmins()
-    MP.SendChatMessage(playerID, " 已添加管理员: " .. targetName .. " (等级 " .. level .. ")")
-    logMsg("管理员 " .. tostring(playerName) .. " 提升 " .. targetName .. " 为管理员(等级" .. level .. ")")
-end
-
-local function removeAdmin(playerID, targetName)
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID)
-    
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    for i, admin in ipairs(admins) do
-        if admin.username == targetName then
-            table.remove(admins, i)
-            saveAdmins()
-            MP.SendChatMessage(playerID, " 已移除管理员: " .. targetName)
-            logMsg("管理员 " .. tostring(playerName) .. " 移除了管理员: " .. targetName)
-            return
-        end
-    end
-    
-    MP.SendChatMessage(playerID, " 错误: 未找到管理员 " .. targetName)
-end
-
-local function banUser(playerID, targetName, reason)
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID)
-    
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    for _, entry in ipairs(banlist.accounts) do
-        if entry.username == targetName then
-            MP.SendChatMessage(playerID, " 账号 " .. targetName .. " 已在封禁列表中")
-            return
-        end
-    end
-    
-    banlist.accounts[#banlist.accounts + 1] = {
-        username = targetName,
-        reason = reason or "未指定原因",
-        time = os.time(),
-        by = playerName
-    }
-    saveBanlist()
-    MP.SendChatMessage(playerID, " 已封禁账号: " .. targetName)
-    logMsg("管理员 " .. tostring(playerName) .. " 封禁了账号: " .. targetName)
-end
-
-local function unbanUser(playerID, targetName)
-    local beamId = getPlayerStableInfo(playerID)
-    local playerName = MP.GetPlayerName(playerID)
-    
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    for i, entry in ipairs(banlist.accounts) do
-        if entry.username == targetName then
-            table.remove(banlist.accounts, i)
-            saveBanlist()
-            MP.SendChatMessage(playerID, " 已解封账号: " .. targetName)
-            logMsg("管理员 " .. tostring(playerName) .. " 解封了账号: " .. targetName)
-            return
-        end
-    end
-    
-    MP.SendChatMessage(playerID, " 错误: 未找到封禁记录 " .. targetName)
-end
-
-local function listAdmins(playerID)
-    local beamId = getPlayerStableInfo(playerID)
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    MP.SendChatMessage(playerID, " =========== 管理员列表 ===========")
-    for _, admin in ipairs(admins) do
-        MP.SendChatMessage(playerID, " " .. admin.username .. " - 等级 " .. tostring(admin.level) .. " (ID: " .. tostring(admin.beam_id) .. ")")
-    end
-    MP.SendChatMessage(playerID, " ====================================")
-end
-
-local function listOnline(playerID)
-    local beamId = getPlayerStableInfo(playerID)
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    MP.SendChatMessage(playerID, " =========== 在线玩家 ===========")
-    local count = 0
-    for id, name in pairs(onlinePlayers) do
-        local stableId, ip, _ = getPlayerStableInfo(id)
-        local role = getPlayerRole(stableId)
-        MP.SendChatMessage(playerID, " " .. tostring(name) .. " - " .. role .. " (IP: " .. tostring(ip) .. ")")
-        count = count + 1
-    end
-    MP.SendChatMessage(playerID, " 共 " .. count .. " 人在线")
-    MP.SendChatMessage(playerID, " ====================================")
-end
-
-local function queryUser(playerID, targetName)
-    local beamId = getPlayerStableInfo(playerID)
-    if not isAdmin(beamId) then
-        MP.SendChatMessage(playerID, " 错误: 你没有管理员权限")
-        return
-    end
-    
-    local account = accounts[targetName]
-    if not account then
-        MP.SendChatMessage(playerID, " 错误: 未找到账号 " .. targetName)
-        return
-    end
-    
-    MP.SendChatMessage(playerID, " =========== 账号信息: " .. targetName .. " ===========")
-    MP.SendChatMessage(playerID, " 注册时间: " .. os.date("%Y-%m-%d %H:%M:%S", account.register_time))
-    MP.SendChatMessage(playerID, " 绑定ID数: " .. tostring(#(account.bind_beam_ids or {})))
-    MP.SendChatMessage(playerID, " 登录次数: " .. tostring(#(account.login_records or {})))
-    
-    local lastLogin = (account.login_records or {})[#(account.login_records or {})]
-    if lastLogin then
-        MP.SendChatMessage(playerID, " 最后登录: " .. os.date("%Y-%m-%d %H:%M:%S", lastLogin.time) .. " (ID: " .. tostring(lastLogin.beam_id) .. ")")
-    end
-    MP.SendChatMessage(playerID, " ================================================")
-end
+-- [已移除: 管理员命令 - 无管理员版]
 
 -- ============================================================
 -- Chat Message Handler
 -- ============================================================
 function onChatMessage(playerID, playerName, message)
     if not message or message == "" then return end
-    
+
+    -- 兜底: 玩家发任何消息都顺便 poll 一次 Bridge 聊天队列 (即使 timer 出问题也能出消息)
+    _tryPollChatQueue()
+
     -- Quick classify: is it a command (/xxx)?
     local isCommand = (type(message) == "string" and message:sub(1, 1) == "/")
     
@@ -995,109 +893,9 @@ function _handleChat(playerID, playerName, message)
             MP.SendChatMessage(playerID, " /whoami - 查看登录状态")
             MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限 (1/5)")
             MP.SendChatMessage(playerID, " /bmpid <payload> - 客户端HWID回传")
-            if role == "管理员" then
-                MP.SendChatMessage(playerID, " --- 管理员命令 ---")
-                MP.SendChatMessage(playerID, " /addadmin <账号> [等级] - 提升为管理员")
-                MP.SendChatMessage(playerID, " /removeadmin <账号> - 移除管理员")
-                MP.SendChatMessage(playerID, " /banuser <账号> [原因] - 封禁账号")
-                MP.SendChatMessage(playerID, " /unbanuser <账号> - 解封账号")
-                MP.SendChatMessage(playerID, " /listadmins - 查看管理员列表")
-                MP.SendChatMessage(playerID, " /listonline - 查看在线玩家")
-                MP.SendChatMessage(playerID, " /queryuser <账号> - 查询账号信息")
-            end
-            MP.SendChatMessage(playerID, " ================================")
-            MP.SendChatMessage(playerID, " [车辆限制] 未认证用户 1 辆, 认证用户 5 辆")
             
-        elseif cmd == "/register" then
-            local username, password = args:match("^(%S+)%s+(.+)$")
-            registerAccount(playerID, username, password)
-            
-        elseif cmd == "/login" then
-            local username, password = args:match("^(%S+)%s+(.+)$")
-            loginAccount(playerID, username, password)
-            
-        elseif cmd == "/logout" then
-            logoutAccount(playerID)
-            
-        elseif cmd == "/whoami" then
-            local beamId2 = getPlayerStableInfo(playerID)
-            local role2 = getPlayerRole(beamId2)
-            MP.SendChatMessage(playerID, " 你当前身份: " .. role2)
-            MP.SendChatMessage(playerID, " 你的ID: " .. tostring(beamId2))
-            if accounts[playerName] then
-                MP.SendChatMessage(playerID, " 已注册账号: " .. playerName)
-            end
-            
-        elseif cmd == "/bmpid" then
-            handleBmpidCommand(playerID, playerName, args)
+        -- [已移除管理员命令]
 
-        elseif cmd == "/vehiclelimit" or cmd == "/vehicles" or cmd == "/carlimit" then
-            local limit = getPlayerVehicleLimit(playerID)
-            local current = playerVehicleCount[playerID] or 0
-            local label = getPlayerAuthLabel(playerID)
-            MP.SendChatMessage(playerID, " ============ 车辆上限 ===========")
-            MP.SendChatMessage(playerID, " 你的身份: " .. label .. "用户")
-            MP.SendChatMessage(playerID, " 当前已生成: " .. tostring(current) .. " / " .. tostring(limit) .. " 辆")
-            if label == "未认证" then
-                MP.SendChatMessage(playerID, " 未认证用户上限 " .. VEHICLE_LIMITS.unauthenticated .. " 辆")
-                MP.SendChatMessage(playerID, " 认证方式: /bmpid <UUID> + /login <账号> <密码>")
-                MP.SendChatMessage(playerID, " 认证后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆")
-            elseif label == "认证" then
-                MP.SendChatMessage(playerID, " 认证用户上限 " .. VEHICLE_LIMITS.authenticated .. " 辆")
-            else
-                MP.SendChatMessage(playerID, " 管理员无车辆限制")
-            end
-            MP.SendChatMessage(playerID, " ================================")
-
-        elseif cmd == "/gethwid" then
-            local beamId3, ip3, _ = getPlayerStableInfo(playerID)
-            MP.SendChatMessage(playerID, " ============ 获取稳定HWID 指南 ===========")
-            MP.SendChatMessage(playerID, " 方法A (推荐·无需客户端mod):")
-            MP.SendChatMessage(playerID, "  1. 在服务器下载目录里找到 BMPHWID_Bridge.exe 并运行")
-            MP.SendChatMessage(playerID, "  2. 保持 BeamNG 在前台，点 Bridge 里的 [一键粘贴发送]")
-            MP.SendChatMessage(playerID, "  3. 服务器收到后会立即私聊提示你 HWID 已绑定 ✅")
-            MP.SendChatMessage(playerID, " 方法B (自己手动复制):")
-            MP.SendChatMessage(playerID, "  1. 运行 BMPHWID_Bridge.exe → 点 [复制命令]")
-            MP.SendChatMessage(playerID, "  2. 在游戏里按 T → Ctrl+V → 回车粘贴发送 /bmpid ... 那一行")
-            MP.SendChatMessage(playerID, " 方法C (客户端mod·优先·最自动化):")
-            MP.SendChatMessage(playerID, "  服务器 BMPHWID.zip 客户端已自动随服务器下发")
-            MP.SendChatMessage(playerID, "  若加载成功，进入服务器后 30 秒内会自动回传 HWID")
-            MP.SendChatMessage(playerID, " 方法D (仅测试):")
-            MP.SendChatMessage(playerID, "  在 BeamNG 控制台执行: extensions.bmpHwidProbe.trySendFull()")
-            MP.SendChatMessage(playerID, " ===========================================")
-            if beamId3 then
-                MP.SendChatMessage(playerID, " 当前你被识别为 ID: " .. tostring(beamId3))
-                MP.SendChatMessage(playerID, " 建议：先登录账号 (/login 账号 密码)，然后按上面任意方法获得稳定HWID，下次自动登录就生效了 ✨")
-            end
-            if ip3 then MP.SendChatMessage(playerID, " 当前IP兜底（无需操作，登录后自动绑定）：IP:" .. ip3) end
-            
-        elseif cmd == "/addadmin" then
-            local target, level = args:match("^(%S+)%s*(%d*)")
-            level = tonumber(level) or 1
-            addAdmin(playerID, target, level)
-            
-        elseif cmd == "/removeadmin" then
-            local target = args:match("^(%S+)")
-            removeAdmin(playerID, target)
-            
-        elseif cmd == "/banuser" then
-            local target, reason = args:match("^(%S+)%s*(.*)")
-            banUser(playerID, target, reason)
-            
-        elseif cmd == "/unbanuser" then
-            local target = args:match("^(%S+)")
-            unbanUser(playerID, target)
-            
-        elseif cmd == "/listadmins" then
-            listAdmins(playerID)
-            
-        elseif cmd == "/listonline" then
-            listOnline(playerID)
-            
-        elseif cmd == "/queryuser" then
-            local target = args:match("^(%S+)")
-            queryUser(playerID, target)
-            
         else
             MP.SendChatMessage(playerID, " 未知命令: " .. cmd .. "，使用 /help 查看可用命令")
         end
@@ -1121,9 +919,6 @@ function onInit()
         loadAccounts()
     end)
     pcall(function()
-        loadAdmins()
-    end)
-    pcall(function()
         loadBanlist()
     end)
     pcall(function()
@@ -1145,7 +940,21 @@ function onInit()
             -- Client HWID plugin events
             MP.RegisterEvent("BMPHWID:HWIDReply", "onHwidReply")
             MP.RegisterEvent("BMPHWID:Version", "onHwidVersion")
-            print("[BMP Login] All events registered successfully (incl. BMPHWID client)")
+
+            -- ============================================================
+            -- Chat queue timer (Bridge GUI → HTTP API → 文件 → 1Hz 轮询 → 公屏广播)
+            -- 官方 API (v3.0+):  MP.CreateEventTimer(name, interval_ms)
+            -- 替代不存在的 onTick (server 端无 onTick, 只有 client mod 才有)
+            -- ============================================================
+            local CHAT_POLL_EVENT = "BMP_CHAT_QUEUE_POLL"
+            MP.RegisterEvent(CHAT_POLL_EVENT, "processChatQueueGlobal")
+            local ok_timer = pcall(function() MP.CreateEventTimer(CHAT_POLL_EVENT, 1000) end)
+            if ok_timer then
+                print("[BMP Login] ChatQueue timer started (1Hz, 1000ms) using MP.CreateEventTimer")
+            else
+                print("[BMP Login] WARN: MP.CreateEventTimer failed, chat queue will be polled on chat/join events only")
+            end
+            print("[BMP Login] All events registered successfully (incl. BMPHWID client + chat poll timer)")
         else
             print("[BMP Login] ERROR: MP.RegisterEvent not available")
         end
@@ -1338,6 +1147,9 @@ function onPlayerConnected(playerID)
     
     local role = getPlayerRole(beamId)
     print("[BMP Login] 玩家连接: " .. tostring(name) .. " (身份: " .. role .. ")")
+
+    -- 兜底: 玩家进服也顺便 poll 一次 Bridge 聊天队列 (之前累积的消息立即出)
+    _tryPollChatQueue()
 end
 
 function onPlayerDisconnect(playerID)
