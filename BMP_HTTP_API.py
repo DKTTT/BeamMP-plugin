@@ -370,12 +370,20 @@ class APIHandler(BaseHTTPRequestHandler):
         ip = (body.get("ip") or "").strip()
         player_name = (body.get("player_name") or "").strip()
 
+        # DEBUG: 打印收到的登录请求 (长度+repr, 不泄露真实内容)
+        _log_login = f"[DBG-LOGIN] user={username!r} pwd_len={len(password)} pwd_repr={repr(password[:3]+'***'+password[-3:]) if len(password)>=6 else repr(password)} hwid_len={len(hwid)}"
+        print(_log_login, flush=True)
+
         with FILE_LOCK:
             accounts = loadAccounts()
             acc = accounts.get(username)
             if not acc:
+                print(f"[DBG-LOGIN] 账号不存在: {username}", flush=True)
                 return self._json(200, {"ok": False, "msg": f"账号 {username} 不存在"})
-            if not verifyPassword(password, acc.get("password_hash") or ""):
+            stored_hash = acc.get("password_hash") or ""
+            ok_pwd = verifyPassword(password, stored_hash)
+            print(f"[DBG-LOGIN] stored_hash_len={len(stored_hash)} verifyResult={ok_pwd}", flush=True)
+            if not ok_pwd:
                 return self._json(200, {"ok": False, "msg": "密码不正确"})
 
             bids = _normalize_beam_ids(hwid, ip, player_name)

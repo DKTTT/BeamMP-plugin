@@ -1050,13 +1050,27 @@ def _run_gui(hwid, sources_list):
         _save_cfg()
         body = {"username": u, "password": pw, "hwid": hwid,
                 "player_name": CFG["last_player_name"]}
+        # DEBUG: 打印实际发送的 body (密码脱敏)
+        _safe_pw = pw[:3] + "***" + pw[-3:] if len(pw) >= 6 else "*" * len(pw)
+        _log(f"[DEBUG] 发送登录请求: user={u!r} pwd={_safe_pw!r} pwd_len={len(pw)} body_keys={list(body.keys())}")
         net_ok, obj = api_post("/api/auth/login", body)
+        _log(f"[DEBUG] API 响应: net_ok={net_ok} obj={json.dumps(obj, ensure_ascii=False)[:200] if isinstance(obj, dict) else obj}")
         if net_ok and obj.get("ok"):
-            # 顺手刷新 whoami
+            # 关键修复: 登录成功后立即保存 token 到 CFG (确保后续 whoami 能带 token)
+            d = obj.get("data") or {}
+            if d.get("access_token"):
+                CFG["access_token"] = d["access_token"]
+                CFG["username"] = d.get("username") or u
+                _save_cfg()
+                _log(f"[DEBUG] token 已保存: {d['access_token'][:10]}...")
+            # 现在 CFG 已有新 token, whoami 能正确带 Authorization 头
             net_ok2, obj2 = api_post("/api/auth/whoami", {})
+            _log(f"[DEBUG] whoami 响应: {json.dumps(obj2, ensure_ascii=False)[:200] if isinstance(obj2, dict) else obj2}")
             _log_response(obj, True)
             _log_response(obj2, net_ok2)
         else:
+            # 登录失败: 清掉旧 token 防止后续请求混乱
+            CFG.pop("access_token", None)
             _log_response(obj, net_ok)
 
     tk.Button(tl, text="🚀 登录", font=("Microsoft YaHei UI", 11, "bold"),
