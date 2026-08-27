@@ -1283,8 +1283,8 @@ def _run_gui(hwid, sources_list):
             return
         # GET /api/chat/queue
         import urllib.request as _ur, urllib.error as _ue
-        base = (CFG.get("server_url") or "").strip().rstrip("/")
-        if not base: return
+        base, _err = _norm_url(CFG.get("server_url") or "")
+        if _err: return
         url = base + "/api/chat/queue"
         try:
             with _ur.urlopen(url, timeout=3) as resp:
@@ -1430,8 +1430,8 @@ def _run_gui(hwid, sources_list):
     
     # 函数: 刷新玩家列表
     def _refresh_players():
-        base = (CFG.get("server_url") or "").strip().rstrip("/")
-        if not base:
+        base, err = _norm_url(CFG.get("server_url") or "")
+        if err:
             list_players.delete(0, "end")
             list_players.insert("end", "(服务器地址未设置)")
             return
@@ -1456,8 +1456,8 @@ def _run_gui(hwid, sources_list):
     
     # 函数: 刷新投票状态 (每3秒轮询)
     def _refresh_vote_status():
-        base = (CFG.get("server_url") or "").strip().rstrip("/")
-        if not base:
+        base, err = _norm_url(CFG.get("server_url") or "")
+        if err:
             root.after(3000, _refresh_vote_status)
             return
         import urllib.request as _ur

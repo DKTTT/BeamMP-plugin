@@ -1831,7 +1831,8 @@ function onPlayerJoining(playerID)
         MP.SendChatMessage(playerID, " ✨ 欢迎回来，已通过【" .. tostring(autoVia) .. "】自动登录为账号: " .. autoUser)
     end
     
-    onlinePlayers[playerID] = name
+    -- 注意: onlinePlayers 只在 onPlayerConnected 中写入 (完整 entry 表)
+    -- 这里只打日志, 避免把字符串写进 onlinePlayers 导致定时器报错
     print("[BMP Login] 玩家加入: " .. tostring(name) .. " (ID: " .. tostring(beamId) .. ")")
 end
 
@@ -2337,7 +2338,8 @@ end
 local hwidChunkAccum = {}  -- playerID -> { chunks = {...}, expected = n, playerName = x }
 
 local function findPlayerIdByName(playerName)
-    for id, n in pairs(onlinePlayers) do
+    for id, info in pairs(onlinePlayers) do
+        local n = (type(info) == "table" and info.name) or info
         if n == playerName then return id end
     end
     -- Fallback: scan by MP.GetPlayerName
