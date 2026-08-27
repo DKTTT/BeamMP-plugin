@@ -251,7 +251,18 @@ ADMINS = set(a.strip() for a in os.environ.get("BMP_ADMINS","").split(",") if a.
 
 def _is_admin(username):
     if not username: return False
-    return username in ADMINS
+    # 1) 检查 ADMINS 集合 (命令行 --admins)
+    if username in ADMINS:
+        return True
+    # 2) 检查 accounts.json 中的 is_admin 字段
+    try:
+        accounts = loadAccounts()
+        acc = accounts.get(username)
+        if acc and isinstance(acc, dict) and acc.get("is_admin"):
+            return True
+    except Exception:
+        pass
+    return False
 
 def _normalize_beam_ids(hwid, ip, player_name, username_bound=None):
     """按 main.lua 的 3 个优先级返回候选 beam_id 列表"""
