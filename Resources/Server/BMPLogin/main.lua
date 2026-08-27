@@ -1,10 +1,10 @@
 -- ============================================================
--- BMP Login Plugin v2.2.0 (无管理员版·由认证器写入)
+-- BMP Login Plugin v2.4.0 (完整管理员版)
 -- BeamMP Server Player Account Management
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "2.3.0-noadmin"
+local PLUGIN_VERSION = "2.4.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -541,6 +541,53 @@ local function getPlayerRole(beamId, playerID)
     return "游客"
 end
 
+-- ============================================================
+-- Admin Check (管理员权限判定)
+--   优先使用 accounts.json 中的 is_admin 字段
+--   回退使用硬编码的 ADMIN_WHITELIST
+-- ============================================================
+local ADMIN_WHITELIST = {
+    -- 在此处添加管理员账号 (小写), 例如: "driftking" = true
+}
+
+local function isPlayerAdmin(playerID)
+    if not playerID then return false end
+    local beamId = getPlayerStableInfo(playerID)
+    if not beamId then return false end
+    local role = getPlayerRole(beamId, playerID)
+    if role == "游客" then return false end
+    
+    -- 方法 1: 通过 playerAuthCache.bound_account 检查 is_admin
+    local uname = nil
+    if playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].bound_account then
+        uname = playerAuthCache[playerID].bound_account
+    end
+    
+    if uname and accounts[uname] and type(accounts[uname]) == "table" then
+        if accounts[uname].is_admin then return true end
+    end
+    
+    -- 方法 2: 检查账号名在白名单
+    if uname and ADMIN_WHITELIST[string.lower(uname)] then
+        return true
+    end
+    
+    -- 方法 3: 遍历所有账号找 is_admin 且匹配 beamId
+    for aname, acc in pairs(accounts) do
+        if type(acc) == "table" and acc.is_admin then
+            -- 检查是否绑定了当前玩家的 beamId
+            local bids = acc.bind_beam_ids or {}
+            if type(bids) == "table" then
+                for _, bid in ipairs(bids) do
+                    if bid == beamId then return true end
+                end
+            end
+        end
+    end
+    
+    return false
+end
+
 
 -- ============================================================
 -- 认证用户判定 (基于稳定 HWID)
@@ -928,14 +975,35 @@ function _handleChat(playerID, playerName, message)
         if not cmd then return end
         cmd = cmd:lower()
         
+        -- 管理员命令: 重载最新数据 (API 可能在服务器运行时修改了 JSON)
+        local admin_cmds = {
+            ["/listonline"] = true, ["/kick"] = true, ["/ban"] = true,
+            ["/unban"] = true, ["/listadmins"] = true, ["/addadmin"] = true,
+            ["/removeadmin"] = true,
+        }
+        if admin_cmds[cmd] then
+            pcall(function() loadAccounts() end)
+            pcall(function() loadBanlist() end)
+        end
+        
         if cmd == "/help" then
-            MP.SendChatMessage(playerID, " =========== 可用命令 ===========")
+            MP.SendChatMessage(playerID, " =========== 玩家命令 ===========")
             MP.SendChatMessage(playerID, " /register <账号> <密码> - 注册新账号")
             MP.SendChatMessage(playerID, " /login <账号> <密码> - 登录账号")
             MP.SendChatMessage(playerID, " /logout - 退出登录")
             MP.SendChatMessage(playerID, " /whoami - 查看登录状态")
-            MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限 (1/5)")
+            MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限")
             MP.SendChatMessage(playerID, " /bmpid <payload> - 客户端HWID回传")
+            if isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " =========== 管理员命令 ===========")
+                MP.SendChatMessage(playerID, " /listonline - 查看在线玩家列表")
+                MP.SendChatMessage(playerID, " /kick <ID> [原因] - 踢出玩家")
+                MP.SendChatMessage(playerID, " /ban <ID> <类型> <值> [天数] [原因] - 封禁玩家")
+                MP.SendChatMessage(playerID, " /unban <ID> <类型> <值> - 解封玩家")
+                MP.SendChatMessage(playerID, " /listadmins - 查看管理员列表")
+                MP.SendChatMessage(playerID, " /addadmin <账号> - 设为管理员")
+                MP.SendChatMessage(playerID, " /removeadmin <账号> - 移除管理员")
+            end
 
         elseif cmd == "/register" then
             local uname, pwd = args:match("^(%S+)%s+(%S+)$")
@@ -975,7 +1043,248 @@ function _handleChat(playerID, playerName, message)
             local payload = args and args:match("^%s*(.-)%s*$") or ""
             handleBmpidCommand(playerID, playerName, payload)
 
-        -- [已移除管理员命令]
+        -- ============ 管理员命令 ============
+        elseif cmd == "/listonline" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            MP.SendChatMessage(playerID, " ======== 在线玩家列表 ========")
+            local count = 0
+            for pid, pdata in pairs(onlinePlayers) do
+                count = count + 1
+                local pname = pdata.name or "Player" .. tostring(pid)
+                local brole = pdata.role or "未知"
+                local acct = pdata.bind_account or ""
+                local beam_id = (pdata.beam_id or ""):sub(1, 50)
+                local veh = pdata.vehicle_count or 0
+                local auth = pdata.is_authenticated and "✓" or "✗"
+                local info = string.format(" [%d] %s | %s | 认证:%s | 账号:%s | 车辆:%d",
+                    pid, pname, brole, auth, acct, veh)
+                MP.SendChatMessage(playerID, info)
+                if beam_id ~= "" then
+                    MP.SendChatMessage(playerID, "   BeamID: " .. beam_id)
+                end
+            end
+            MP.SendChatMessage(playerID, " 共 " .. tostring(count) .. " 人在线")
+
+        elseif cmd == "/kick" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            local target_id, reason = args:match("^(%d+)%s*(.*)$")
+            target_id = tonumber(target_id)
+            if not target_id then
+                MP.SendChatMessage(playerID, " 用法: /kick <玩家ID> [原因]")
+                return
+            end
+            if onlinePlayers[target_id] then
+                local tname = onlinePlayers[target_id].name or "Player" .. tostring(target_id)
+                reason = (reason and reason:match("^%s*(.-)%s*$")) or "管理员踢出"
+                local now = os.time()
+                local kick_entry = {
+                    id = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
+                    playerID = target_id,
+                    reason = reason,
+                    time = now,
+                    done = false,
+                }
+                local queue = readJsonFile(KICK_QUEUE_FILE) or {}
+                if type(queue) ~= "table" then queue = {} end
+                table.insert(queue, kick_entry)
+                writeJsonFile(KICK_QUEUE_FILE, queue)
+                MP.SendChatMessage(playerID, " 已踢出 #" .. target_id .. " " .. tname .. " (原因: " .. reason .. ")")
+                MP.SendChatMessage(-1, " [踢出] " .. tostring(tname) .. " 已被管理员踢出 (原因: " .. reason .. ")")
+                print("[BMP Login] 管理员 " .. tostring(playerName) .. " 踢出玩家 #" .. target_id .. " 原因: " .. tostring(reason))
+            else
+                MP.SendChatMessage(playerID, " 找不到玩家 ID #" .. tostring(target_id))
+            end
+
+        elseif cmd == "/ban" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            -- /ban <玩家ID> <类型> <值> [天数] [原因]
+            local target_id, btype, bval, days_rest, reason_rest = args:match("^(%d+)%s+(%S+)%s+(%S+)%s*(.*)$")
+            target_id = tonumber(target_id)
+            if not target_id or not btype or not bval then
+                MP.SendChatMessage(playerID, " 用法: /ban <玩家ID> <account|hwid|ip|name> <值> [天数] [原因]")
+                MP.SendChatMessage(playerID, " 示例: /ban 3 hwid a543b2c8-edc1 7 使用外挂")
+                MP.SendChatMessage(playerID, "       /ban 2 account DRIFTKING 0 永久封禁")
+                return
+            end
+            local duration_days = 0
+            local reason = ""
+            if days_rest then
+                local d, r = days_rest:match("^(%d+)%s*(.*)$")
+                if d then
+                    duration_days = tonumber(d)
+                    reason = r or ""
+                else
+                    reason = days_rest
+                end
+            end
+            btype = btype:lower()
+            if btype == "id" then btype = "account" end  -- 兼容旧用法
+            if btype ~= "account" and btype ~= "hwid" and btype ~= "ip" and btype ~= "name" then
+                MP.SendChatMessage(playerID, " 类型必须是 account/hwid/ip/name")
+                return
+            end
+            if not reason or reason == "" then reason = "管理员封禁" end
+            local now = os.time()
+            local expires_at = duration_days > 0 and (now + duration_days * 86400) or 0
+            
+            loadBanlist()  -- reload global banlist
+            local key = (btype == "account" or btype == "name") and "accounts" or "devices"
+            banlist[key] = banlist[key] or {}
+            
+            local entry
+            if btype == "account" or btype == "name" then
+                entry = {account = bval, value = bval, reason = reason,
+                         time = now, duration_days = duration_days, expires_at = expires_at}
+            elseif btype == "hwid" then
+                entry = {device_id = bval, value = bval, reason = reason,
+                         time = now, duration_days = duration_days, expires_at = expires_at}
+            else
+                entry = {ip = bval, value = bval, reason = reason,
+                         time = now, duration_days = duration_days, expires_at = expires_at}
+            end
+            
+            -- 去除旧的相同条目
+            local new_list = {}
+            for _, e in ipairs(banlist[key]) do
+                if type(e) == "table" and (e.value or "") ~= bval then
+                    table.insert(new_list, e)
+                end
+            end
+            table.insert(new_list, entry)
+            banlist[key] = new_list
+            writeJsonFile(BANLIST_FILE, banlist)
+            
+            local dur_text = duration_days > 0 and (duration_days .. "天") or "永久"
+            local target_name = onlinePlayers[target_id] and onlinePlayers[target_id].name or "Player" .. tostring(target_id)
+            MP.SendChatMessage(playerID, " 已封禁 " .. btype .. ":" .. bval .. " (" .. dur_text .. ")")
+            MP.SendChatMessage(playerID, " 目标玩家 #" .. target_id .. " " .. tostring(target_name))
+            print("[BMP Login] 管理员 " .. tostring(playerName) .. " 封禁 " .. btype .. ":" .. bval .. " " .. dur_text)
+            
+            -- 立即踢出已在线的被封禁玩家
+            if onlinePlayers[target_id] then
+                pcall(function() MP.DropPlayer(target_id, "您已被封禁: " .. reason) end)
+            end
+
+        elseif cmd == "/unban" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            local btype, bval = args:match("^(%S+)%s+(%S+)$")
+            if not btype or not bval then
+                MP.SendChatMessage(playerID, " 用法: /unban <account|hwid|ip|name> <值>")
+                return
+            end
+            btype = btype:lower()
+            loadBanlist()  -- reload global banlist
+            local key = (btype == "account" or btype == "name") and "accounts" or "devices"
+            banlist[key] = banlist[key] or {}
+            local new_list = {}
+            for _, e in ipairs(banlist[key]) do
+                if type(e) == "table" and (e.value or "") ~= bval then
+                    table.insert(new_list, e)
+                end
+            end
+            banlist[key] = new_list
+            writeJsonFile(BANLIST_FILE, banlist)
+            MP.SendChatMessage(playerID, " 已解封 " .. btype .. ":" .. bval)
+            print("[BMP Login] 管理员 " .. tostring(playerName) .. " 解封 " .. btype .. ":" .. bval)
+
+        elseif cmd == "/listadmins" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            MP.SendChatMessage(playerID, " ======== 管理员列表 ========")
+            local count = 0
+            for uname, acc in pairs(accounts) do
+                if type(acc) == "table" and acc.is_admin then
+                    count = count + 1
+                    MP.SendChatMessage(playerID, "  - " .. tostring(uname))
+                end
+            end
+            for uname, _ in pairs(ADMIN_WHITELIST) do
+                count = count + 1
+                MP.SendChatMessage(playerID, "  - " .. tostring(uname) .. " (白名单)")
+            end
+            if count == 0 then
+                MP.SendChatMessage(playerID, " (暂无管理员)")
+            else
+                MP.SendChatMessage(playerID, " 共 " .. tostring(count) .. " 个管理员")
+            end
+
+        elseif cmd == "/addadmin" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            local target = args:match("^(%S+)")
+            if not target then
+                MP.SendChatMessage(playerID, " 用法: /addadmin <账号>")
+                return
+            end
+            -- 查找账号 (大小写不敏感)
+            local found_key = nil
+            for k, _ in pairs(accounts) do
+                if k:lower() == target:lower() then
+                    found_key = k
+                    break
+                end
+            end
+            if found_key then
+                accounts[found_key].is_admin = true
+                saveAccounts()
+                MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已设为管理员")
+                print("[BMP Login] 管理员 " .. tostring(playerName) .. " 提升 " .. found_key .. " 为管理员")
+            else
+                MP.SendChatMessage(playerID, " 账号 " .. target .. " 不存在")
+            end
+
+        elseif cmd == "/removeadmin" then
+            if not isPlayerAdmin(playerID) then
+                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
+                return
+            end
+            local target = args:match("^(%S+)")
+            if not target then
+                MP.SendChatMessage(playerID, " 用法: /removeadmin <账号>")
+                return
+            end
+            -- 查找账号 (大小写不敏感)
+            local found_key = nil
+            for k, _ in pairs(accounts) do
+                if k:lower() == target:lower() then
+                    found_key = k
+                    break
+                end
+            end
+            local found_whitelist = nil
+            for wk, _ in pairs(ADMIN_WHITELIST) do
+                if wk:lower() == target:lower() then
+                    found_whitelist = wk
+                    break
+                end
+            end
+            if found_key then
+                accounts[found_key].is_admin = false
+                saveAccounts()
+                MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已移除管理员权限")
+                print("[BMP Login] 管理员 " .. tostring(playerName) .. " 移除 " .. found_key .. " 的管理员权限")
+            elseif found_whitelist then
+                ADMIN_WHITELIST[found_whitelist] = nil
+                MP.SendChatMessage(playerID, " 账号 " .. found_whitelist .. " 已从白名单移除")
+            else
+                MP.SendChatMessage(playerID, " 账号 " .. target .. " 不是管理员")
+            end
 
         else
             MP.SendChatMessage(playerID, " 未知命令: " .. cmd .. "，使用 /help 查看可用命令")

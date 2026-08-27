@@ -903,6 +903,9 @@ class APIHandler(BaseHTTPRequestHandler):
             accounts = loadAccounts()
             if target not in accounts:
                 return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
+            # 持久化 is_admin 到 accounts.json (供 Lua 插件读取)
+            accounts[target]["is_admin"] = set_admin
+            saveAccounts(accounts)
             if set_admin:
                 ADMINS.add(target)
             else:
