@@ -58,13 +58,20 @@ def _save_cfg():
 # ---- urllib 客户端 (POST JSON) ----
 import urllib.request, urllib.error
 
+def _norm_url(base):
+    """把用户输入的 URL 规范化: 自动补 http:// 前缀, 去尾斜杠"""
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        return "", "请先填入服务器 HTTP API 地址"
+    if not (base.startswith("http://") or base.startswith("https://")):
+        base = "http://" + base
+    return base, ""
+
 def api_post(path, body_obj=None, timeout=8):
     """POST JSON 到服务器 HTTP API. 返回 (ok, result_dict)"""
-    base = (CFG.get("server_url") or "").strip().rstrip("/")
-    if not base:
-        return False, {"ok": False, "msg": "请先在【直连服务器】选项卡顶部填入服务器 HTTP API 地址"}
-    if not (base.startswith("http://") or base.startswith("https://")):
-        return False, {"ok": False, "msg": "服务器地址必须以 http:// 或 https:// 开头"}
+    base, err = _norm_url(CFG.get("server_url") or "")
+    if err:
+        return False, {"ok": False, "msg": err}
     url = base + path
     token = CFG.get("access_token") or ""
     data = b"{}" if body_obj is None else json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
@@ -91,9 +98,9 @@ def api_post(path, body_obj=None, timeout=8):
         return False, {"ok": False, "msg": "请求失败: " + str(e)}
 
 def api_ping(timeout=6):
-    base = (CFG.get("server_url") or "").strip().rstrip("/")
-    if not base:
-        return False, {"ok": False, "msg": "请先填入服务器 HTTP API 地址"}
+    base, err = _norm_url(CFG.get("server_url") or "")
+    if err:
+        return False, {"ok": False, "msg": err}
     url = base + "/api/ping"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -872,7 +879,7 @@ def _run_gui(hwid, sources_list):
     # ---- 顶部 URL 栏 ----
     cfg_bar = tk.Frame(tab3, bg="#f7f7f9")
     cfg_bar.pack(fill="x", padx=12, pady=(12, 4))
-    tk.Label(cfg_bar, text="服务器 HTTP API 地址:",
+    tk.Label(cfg_bar, text="服务器 API 地址:",
              font=("Microsoft YaHei UI", 10, "bold"),
              bg="#f7f7f9", fg="#1d3557").pack(side="left")
     url_entry = tk.Entry(cfg_bar, font=("Consolas", 11), bg="#ffffff", fg="#0f172a",
@@ -920,13 +927,18 @@ def _run_gui(hwid, sources_list):
     def _refresh_sess_label():
         tok = CFG.get("access_token") or ""
         u = CFG.get("username")
+        url_display = (CFG.get("server_url") or "未填")
+        # 自动规范化显示 (如果没 http:// 就补上)
+        base = url_display.strip().rstrip("/")
+        if base and not (base.startswith("http://") or base.startswith("https://")):
+            url_display = "http://" + base
         if tok and u:
             lbl = f" 状态: 已登录 账号 {u}"
             if CFG.get("label"): lbl += f"  (身份: {CFG['label']}, 车辆上限: {CFG.get('limit','?')})"
             sess_label.configure(text=lbl, bg="#dcfce7", fg="#166534")
             sess_bar.configure(bg="#dcfce7")
         else:
-            sess_label.configure(text=" 状态: 未登录 (请先注册或登录)",
+            sess_label.configure(text=f" 状态: 未登录 | 服务器: {url_display} (请先注册或登录)",
                                  bg="#fef3c7", fg="#92400e")
             sess_bar.configure(bg="#fef3c7")
 
