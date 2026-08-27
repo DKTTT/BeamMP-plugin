@@ -393,7 +393,10 @@ class AdminApp:
                 pid, name, role, auth, acct, beam_id, veh, online_text))
         count = len(r.get("data", []))
         if not silent:
-            self._set_status(f"✅ 在线 {count} 人", "#10b981")
+            if count == 0:
+                self._set_status("⚠️ 在线 0 人 — 请确认 BeamMP 服务器已启动并加载 BMP Login 插件", "#fbbf24")
+            else:
+                self._set_status(f"✅ 在线 {count} 人", "#10b981")
 
     def _kick_selected(self):
         sel = self.tv_online.selection()
@@ -971,7 +974,10 @@ class AdminApp:
             ))
         unsent = r.get("data", {}).get("unsent", 0)
         total = r.get("data", {}).get("total", 0)
-        self._set_status(f"✅ 队列: {total} 条, 待发 {unsent} 条", "#10b981")
+        if unsent > 0:
+            self._set_status(f"⚠️ 队列: {total} 条, 待发 {unsent} 条 — BeamMP 服务器启动后自动广播", "#fbbf24")
+        else:
+            self._set_status(f"✅ 队列: {total} 条, 全部已发送", "#10b981")
 
     def _admin_chat_send(self):
         if not self._require_admin(): return
