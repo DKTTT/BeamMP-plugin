@@ -255,11 +255,20 @@ local function hashPassword(password)
 end
 
 local function verifyPassword(password, storedHash)
-    if not storedHash or storedHash == "" then return false end
+    if not storedHash or storedHash == "" then
+        print("[BMP Login] verifyPassword: storedHash is empty!")
+        return false
+    end
     
     local salt = storedHash:match("^([^:]+):")
     local hash = storedHash:match(":(.+)$")
-    if not salt or not hash then return false end
+    if not salt or not hash then
+        print("[BMP Login] verifyPassword: failed to parse salt:hash from stored")
+        return false
+    end
+    
+    print("[BMP Login] verifyPassword: salt=" .. salt .. " (#" .. #salt .. ") hash_len=" .. #hash)
+    print("[BMP Login] verifyPassword: hash=" .. hash)
     
     if #hash > 64 then hash = hash:sub(-64) end
     
@@ -276,6 +285,9 @@ local function verifyPassword(password, storedHash)
         local s = saltBytes[((i - 1) % 8) + 1]
         computed = computed .. string.char((c + s + i) % 95 + 32)
     end
+    
+    print("[BMP Login] verifyPassword: computed=" .. computed)
+    print("[BMP Login] verifyPassword: match=" .. tostring(computed == hash))
     
     return computed == hash
 end
@@ -776,7 +788,12 @@ local function loginAccount(playerID, username, password)
     end
     
     local account = accounts[username]
-    if not verifyPassword(password, account.password_hash) then
+    
+    local storedHash = account.password_hash or ""
+    -- DEBUG: 打印 hash 前 20 字符 + 长度
+    print("[BMP Login] DEBUG verify: user=" .. username .. " hash_len=" .. #storedHash .. " hash_prefix=" .. storedHash:sub(1, 20))
+    
+    if not verifyPassword(password, storedHash) then
         MP.SendChatMessage(playerID, " 错误: 密码不正确")
         return false
     end
@@ -813,6 +830,11 @@ local function loginAccount(playerID, username, password)
     }
     
     saveAccounts()
+    -- 标记为已认证 (bound_account, isPlayerAuthenticated 方法 3)
+    if not playerAuthCache then playerAuthCache = {} end
+    playerAuthCache[playerID] = playerAuthCache[playerID] or {}
+    playerAuthCache[playerID].bound_account = username
+    
     MP.SendChatMessage(playerID, " 登录成功！欢迎回来，" .. username)
     logMsg("玩家 " .. tostring(playerName) .. " 登录了账号: " .. username)
     return true
@@ -862,6 +884,16 @@ function onChatMessage(playerID, playerName, message)
     if isCommand then
         return 1
     end
+    
+    -- 认证用户发言: 加 [授信用户] 前缀重新广播 (拦截原消息, 手动转发)
+    if not isCommand then
+        local beamId = getPlayerStableInfo(playerID)
+        if beamId and isPlayerAuthenticated(playerID) then
+            MP.SendChatMessage(-1, " [授信用户] " .. playerName .. ": " .. message)
+            return 1  -- 拦截原消息, 用带前缀的替代
+        end
+    end
+    
     -- 普通聊天返回 0 = 允许正常广播
     return 0
 end
