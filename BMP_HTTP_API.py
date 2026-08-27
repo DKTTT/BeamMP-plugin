@@ -1050,7 +1050,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def _admin_kick(self, body):
         """Add a player to the kick queue (Lua polls every 3s and drops them)"""
-        player_id = (body.get("playerID") or body.get("player_id") or body.get("pid"))
+        player_id = body.get("playerID", body.get("player_id", body.get("pid")))
         reason = (body.get("reason") or "管理员踢出").strip()
         if player_id is None:
             return self._json(400, {"ok": False, "error": "需要 playerID"})
