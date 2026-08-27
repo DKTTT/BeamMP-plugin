@@ -29,8 +29,10 @@ local function logMsg(msg)
     print("[BMP Login] " .. tostring(msg))
 end
 
+local DEBUG_VERBOSE = false  -- 设为 true 可启用详细调试日志
+
 local function logDebug(msg)
-    if not msg then return end
+    if not msg or not DEBUG_VERBOSE then return end
     print("[BMP Login] [DEBUG] " .. tostring(msg))
 end
 
@@ -1599,9 +1601,20 @@ end
 function _saveOnlinePlayers()
     local list = Array({})
     for pid, data in pairs(onlinePlayers) do
-        table.insert(list, data)
+        if type(data) == "table" then
+            table.insert(list, data)
+        end
     end
-    writeJsonFile(ONLINE_FILE, list)
+    local ok, encoded = pcall(jsonEncode, list)
+    if ok and encoded then
+        local f = io.open(ONLINE_FILE, "w")
+        if f then
+            f:write(encoded)
+            f:close()
+        end
+    else
+        logWarn("_saveOnlinePlayers: jsonEncode failed: " .. tostring(encoded))
+    end
 end
 
 -- ============================================================
