@@ -231,17 +231,20 @@ class AdminApp:
         self.tv_accounts.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=4)
         vsb.pack(side="left", fill="y", pady=4)
 
-        # 详情面板
+        # 详情面板 (可滚动 Text, 防截断)
         detail_frame = tk.LabelFrame(tab, text="账号详情 / 绑定 HWID",
                                       font=("Microsoft YaHei UI", 9, "bold"),
                                       bg="#f0f2f5", fg="#334155")
         detail_frame.pack(fill="x", padx=8, pady=4)
 
-        self.lbl_detail = tk.Label(detail_frame, text="选中账号查看详情",
-                                    font=("Microsoft YaHei UI", 9),
-                                    bg="#f0f2f5", fg="#64748b",
-                                    anchor="w", justify="left")
-        self.lbl_detail.pack(fill="x", padx=8, pady=8, anchor="w")
+        self.txt_detail = tk.Text(detail_frame, height=8, wrap="word",
+                                    font=("Consolas", 9),
+                                    bg="white", fg="#334155",
+                                    relief="solid", bd=1,
+                                    state="disabled", cursor="arrow")
+        self.txt_detail.pack(fill="x", padx=8, pady=8)
+        self.txt_detail.insert("1.0", "选中账号查看详情")
+        self.txt_detail.config(state="disabled")
 
         self.tv_accounts.bind("<<TreeviewSelect>>", self._on_account_select)
 
@@ -548,18 +551,49 @@ class AdminApp:
             for a in r.get("data", []):
                 if a["username"] == username:
                     bids = a.get("bind_beam_ids", [])
-                    lines = [f"账号: {username}  |  管理员: {a['is_admin']}  |  绑定数: {len(bids)}"]
+                    # ---- 按前缀分组 + 去重: GUEST 只留最近一条 ----
+                    grouped = {"HWID": [], "IP": [], "GUEST": [], "NAME": []}
+                    for b in bids:
+                        tag = b.split(":", 1)[0] if ":" in b else "OTHER"
+                        if tag in grouped:
+                            grouped[tag].append(b)
+                        else:
+                            grouped.setdefault("OTHER", []).append(b)
+
+                    lines = [f"账号: {username}  |  管理员: {'是' if a['is_admin'] else '否'}  |  总绑定: {len(bids)}"]
                     lines.append("")
-                    if bids:
-                        lines.append("绑定 HWID / IP / GUEST:")
-                        for b in bids:
-                            tag = b.split(":")[0] if ":" in b else "  "
-                            lines.append(f"  [{tag}] {b}")
-                    else:
-                        lines.append("(无绑定)")
-                    lines.append("")
+
+                    # 逐类显示
+                    def show_group(label, items, limit=None):
+                        if not items: return
+                        if limit and len(items) > limit:
+                            lines.append(f"  [{label}] {items[0]}  (共 {len(items)} 条, 仅显示最近)")
+                        else:
+                            for it in items:
+                                lines.append(f"  [{label}] {it}")
+                        lines.append("")
+
+                    show_group("HWID", grouped.get("HWID", []))
+                    show_group("IP", grouped.get("IP", []))
+                    show_group("NAME", grouped.get("NAME", []))
+                    show_group("GUEST", grouped.get("GUEST", []), limit=1)
+
+                    # 其他类型
+                    for tag, items in grouped.items():
+                        if tag not in ("HWID", "IP", "NAME", "GUEST"):
+                            show_group(tag, items)
+
+                    if not bids:
+                        lines.append("  (无绑定)")
+                        lines.append("")
+
                     lines.append(f"注册: {fmt_time(a.get('register_time'))}  |  最后登录: {fmt_time(a.get('last_login'))}")
-                    self.lbl_detail.config(text="\n".join(lines), fg="#334155")
+
+                    # 写入 Text 控件
+                    self.txt_detail.config(state="normal")
+                    self.txt_detail.delete("1.0", "end")
+                    self.txt_detail.insert("1.0", "\n".join(lines))
+                    self.txt_detail.config(state="disabled")
                     break
 
     def _delete_account(self):

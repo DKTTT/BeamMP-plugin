@@ -116,6 +116,28 @@ def _ensure_list(v):
     if isinstance(v, dict) and not v: return []
     return []
 
+def _deduplicate_bids(bids):
+    """精简 bind_beam_ids: GUEST 只保留最近一条 (减少 UI 噪音)"""
+    bids = _ensure_list(bids)
+    if len(bids) <= 3:
+        return bids
+    grouped = {}
+    order = []
+    for b in bids:
+        tag = b.split(":", 1)[0] if ":" in b else "OTHER"
+        if tag not in grouped:
+            grouped[tag] = []
+            order.append(tag)
+        grouped[tag].append(b)
+    result = []
+    for tag in order:
+        items = grouped[tag]
+        if tag == "GUEST" and len(items) > 1:
+            result.append(items[-1])  # 只保留最近一条
+        else:
+            result.extend(items)
+    return result
+
 def readJsonFile(path):
     if not os.path.exists(path): return None
     try:
@@ -805,18 +827,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return self._json(404, {"ok": False, "error": "admin endpoint not found: " + path})
 
+    # ---- 账号列表 (GUEST 精简) ----
     def _admin_list_accounts(self):
-        """列出所有账号 (脱敏密码 hash)"""
+        """列出所有账号 (脱敏密码 hash, GUEST 条目精简)"""
         with FILE_LOCK:
             accounts = loadAccounts()
         result = []
         for uname, acc in sorted(accounts.items()):
             ph = acc.get("password_hash", "") or ""
             ph_short = ph[:16] + "..." if len(ph) > 16 else ph
+            all_bids = _ensure_list(acc.get("bind_beam_ids"))
+            clean_bids = _deduplicate_bids(all_bids)
             result.append({
                 "username": uname,
                 "is_admin": _is_admin(uname),
-                "bind_beam_ids": _ensure_list(acc.get("bind_beam_ids")),
+                "bind_beam_ids": clean_bids,
+                "bind_beam_ids_full": all_bids,
                 "login_records_count": len(_ensure_list(acc.get("login_records"))),
                 "last_login": (_ensure_list(acc.get("login_records"))[-1].get("time")
                               if _ensure_list(acc.get("login_records")) else None),
