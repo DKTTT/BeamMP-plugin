@@ -1299,13 +1299,212 @@ def _run_gui(hwid, sources_list):
     ttk.Button(input_row, text="🔄 刷新队列", command=_refresh_chat_queue
                ).grid(row=0, column=4, padx=4, pady=4, sticky="e")
 
+    # ============================================================
+    # Tab 4: 在线玩家 + 投票踢出
+    # ============================================================
+    tab4 = tk.Frame(nb, bg="#f7f7f9")
+    nb.add(tab4, text="  \U0001F3AE 玩家列表 + 投票  ")
+    
+    # 顶部: 自己的名字 + 服务器状态
+    vk_top = tk.Frame(tab4, bg="#f7f7f9")
+    vk_top.pack(fill="x", padx=10, pady=(10, 4))
+    tk.Label(vk_top, text="你的名字:", font=("Microsoft YaHei UI", 10, "bold"),
+             bg="#f7f7f9", fg="#0f172a").pack(side="left", padx=(0, 4))
+    e_vote_name = tk.Entry(vk_top, font=("Microsoft YaHei UI", 11), width=16)
+    e_vote_name.insert(0, CFG.get("last_player_name") or CFG.get("username") or "")
+    e_vote_name.pack(side="left")
+    
+    lbl_vote_status = tk.Label(vk_top, text="", font=("Microsoft YaHei UI", 9),
+                               bg="#f7f7f9", fg="#64748b")
+    lbl_vote_status.pack(side="left", padx=12)
+    
+    # 主体: 左右分栏
+    vk_body = tk.Frame(tab4, bg="#f7f7f9")
+    vk_body.pack(fill="both", expand=True, padx=10, pady=4)
+    
+    # 左侧: 玩家列表
+    vk_left = tk.LabelFrame(vk_body, text=" 在线玩家 (仅名字) ", font=("Microsoft YaHei UI", 9, "bold"),
+                            bg="#ffffff", fg="#1d3557")
+    vk_left.pack(side="left", fill="both", expand=True, padx=(0, 4))
+    
+    sb_vote = tk.Scrollbar(vk_left)
+    sb_vote.pack(side="right", fill="y")
+    list_players = tk.Listbox(vk_left, font=("Microsoft YaHei UI", 11), bg="#fffbeb",
+                               selectbackground="#fbbf24", selectforeground="#0f172a",
+                               yscrollcommand=sb_vote.set, activestyle="dotbox")
+    list_players.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+    sb_vote.config(command=list_players.yview)
+    
+    # 刷新按钮
+    tk.Button(vk_left, text="🔄 刷新玩家", font=("Microsoft YaHei UI", 9),
+              bg="#f7f7f9", fg="#475569", bd=1, relief="solid",
+              command=lambda: _refresh_players()
+              ).pack(side="bottom", fill="x", padx=4, pady=4)
+    
+    # 右侧: 投票操作面板
+    vk_right = tk.Frame(vk_body, bg="#ffffff", bd=1, relief="solid")
+    vk_right.pack(side="right", fill="y", padx=(4, 0))
+    
+    # 发起投票区
+    vk_init_frame = tk.LabelFrame(vk_right, text=" 发起投票踢出 ", font=("Microsoft YaHei UI", 9, "bold"),
+                                   bg="#ffffff", fg="#dc2626")
+    vk_init_frame.pack(fill="x", padx=8, pady=(8, 4))
+    
+    tk.Label(vk_init_frame, text="选中上面的玩家 → 点击发起",
+             font=("Microsoft YaHei UI", 9), bg="#ffffff", fg="#475569").pack(fill="x", padx=4, pady=2)
+    
+    tk.Label(vk_init_frame, text="原因:", font=("Microsoft YaHei UI", 10),
+             bg="#ffffff", fg="#0f172a").pack(anchor="w", padx=4)
+    e_vote_reason = tk.Entry(vk_init_frame, font=("Microsoft YaHei UI", 10), width=24)
+    e_vote_reason.pack(fill="x", padx=4, pady=(0, 4))
+    
+    def _do_vote_kick():
+        name = e_vote_name.get().strip()
+        if not name:
+            lbl_vote_status.configure(text="请先填写你的名字", fg="#dc2626")
+            return
+        sel = list_players.curselection()
+        if not sel:
+            lbl_vote_status.configure(text="请先在左边选择目标玩家", fg="#dc2626")
+            return
+        target = list_players.get(sel[0])
+        reason = e_vote_reason.get().strip()
+        body = {"target_name": target, "initiator_name": name, "reason": reason}
+        net_ok, obj = api_post("/api/vote/kick", body)
+        if net_ok and obj.get("ok"):
+            lbl_vote_status.configure(text=f"已发起对 {target} 的投票", fg="#16a34a")
+        else:
+            lbl_vote_status.configure(text=obj.get("error", "发起失败"), fg="#dc2626")
+    
+    tk.Button(vk_init_frame, text="⚡ 发起投票踢出", font=("Microsoft YaHei UI", 10, "bold"),
+              bg="#dc2626", fg="white", activebackground="#b91c1c", activeforeground="white",
+              padx=12, pady=4, bd=0, command=_do_vote_kick
+              ).pack(fill="x", padx=4, pady=4)
+    
+    # 分割线
+    tk.Frame(vk_right, bg="#e2e8f0", height=1).pack(fill="x", padx=8, pady=6)
+    
+    # 参与投票区
+    vk_cast_frame = tk.LabelFrame(vk_right, text=" 参与投票 ", font=("Microsoft YaHei UI", 9, "bold"),
+                                   bg="#ffffff", fg="#16a34a")
+    vk_cast_frame.pack(fill="x", padx=8, pady=(0, 4))
+    
+    lbl_vote_target = tk.Label(vk_cast_frame, text="当前无进行中的投票",
+                                font=("Microsoft YaHei UI", 9), bg="#ffffff", fg="#475569",
+                                wraplength=200, justify="left")
+    lbl_vote_target.pack(fill="x", padx=4, pady=2)
+    
+    lbl_vote_countdown = tk.Label(vk_cast_frame, text="",
+                                  font=("Microsoft YaHei UI", 9, "bold"), bg="#ffffff", fg="#1d3557")
+    lbl_vote_countdown.pack(fill="x", padx=4, pady=(0, 4))
+    
+    btn_yes = tk.Button(vk_cast_frame, text="  赞成 (YES)  ", font=("Microsoft YaHei UI", 10, "bold"),
+                         bg="#16a34a", fg="white", activebackground="#15803d", activeforeground="white",
+                         padx=10, pady=4, bd=0, state="disabled")
+    btn_yes.pack(fill="x", padx=4, pady=2)
+    
+    btn_no = tk.Button(vk_cast_frame, text="  反对 (NO)  ", font=("Microsoft YaHei UI", 10, "bold"),
+                        bg="#dc2626", fg="white", activebackground="#b91c1c", activeforeground="white",
+                        padx=10, pady=4, bd=0, state="disabled")
+    btn_no.pack(fill="x", padx=4, pady=(2, 4))
+    
+    def _do_vote_cast(vote_val):
+        name = e_vote_name.get().strip()
+        if not name:
+            lbl_vote_status.configure(text="请先填写你的名字", fg="#dc2626")
+            return
+        body = {"voter_name": name, "vote": vote_val}
+        net_ok, obj = api_post("/api/vote/cast", body)
+        if net_ok and obj.get("ok"):
+            lbl_vote_status.configure(text=f"已投票: {vote_val}", fg="#16a34a")
+        else:
+            lbl_vote_status.configure(text=obj.get("error", "投票失败"), fg="#dc2626")
+    
+    btn_yes.configure(command=lambda: _do_vote_cast("yes"))
+    btn_no.configure(command=lambda: _do_vote_cast("no"))
+    
+    # 投票进度
+    lbl_vote_progress = tk.Label(vk_right, text="", font=("Microsoft YaHei UI", 9),
+                                  bg="#ffffff", fg="#64748b", justify="left")
+    lbl_vote_progress.pack(fill="x", padx=8, pady=4)
+    
+    # 函数: 刷新玩家列表
+    def _refresh_players():
+        base = (CFG.get("server_url") or "").strip().rstrip("/")
+        if not base:
+            list_players.delete(0, "end")
+            list_players.insert("end", "(服务器地址未设置)")
+            return
+        import urllib.request as _ur
+        try:
+            with _ur.urlopen(base + "/api/players/names", timeout=3) as resp:
+                raw = resp.read() or b"{}"
+                o = json.loads(raw.decode("utf-8"))
+                names = o.get("data", []) if o.get("ok") else []
+                list_players.delete(0, "end")
+                if names:
+                    for n in names:
+                        list_players.insert("end", n)
+                    lbl_vote_status.configure(text=f"共 {len(names)} 人在线", fg="#16a34a")
+                else:
+                    list_players.insert("end", "(暂无玩家在线)")
+                    lbl_vote_status.configure(text="无在线玩家", fg="#64748b")
+        except Exception:
+            list_players.delete(0, "end")
+            list_players.insert("end", "(连接服务器失败)")
+            lbl_vote_status.configure(text="服务器连接失败", fg="#dc2626")
+    
+    # 函数: 刷新投票状态 (每3秒轮询)
+    def _refresh_vote_status():
+        base = (CFG.get("server_url") or "").strip().rstrip("/")
+        if not base:
+            root.after(3000, _refresh_vote_status)
+            return
+        import urllib.request as _ur
+        try:
+            with _ur.urlopen(base + "/api/vote/status", timeout=3) as resp:
+                raw = resp.read() or b"{}"
+                o = json.loads(raw.decode("utf-8"))
+                pending = o.get("pending_kick")
+                if pending:
+                    target = pending.get("target_name", "?")
+                    initiator = pending.get("initiator_name", "?")
+                    reason = pending.get("reason", "")
+                    lbl_vote_target.configure(text=f"投票中: {initiator} → {target}\n原因: {reason}")
+                    lbl_vote_countdown.configure(text="请投票! 赞成或反对")
+                    btn_yes.configure(state="normal")
+                    btn_no.configure(state="normal")
+                    lbl_vote_progress.configure(text="投票正在进行中, 请在游戏中查看实时进度")
+                else:
+                    lbl_vote_target.configure(text="当前无进行中的投票")
+                    lbl_vote_countdown.configure(text="")
+                    btn_yes.configure(state="disabled")
+                    btn_no.configure(state="disabled")
+                    lbl_vote_progress.configure(text="")
+        except Exception:
+            pass
+        root.after(3000, _refresh_vote_status)
+    
+    # 自动定时刷新
+    def _auto_refresh_all():
+        _refresh_players()
+        root.after(5000, _auto_refresh_all)
+    
+    # 首次加载
+    try:
+        _refresh_players()
+    except Exception:
+        pass
+    _refresh_vote_status()
+    root.after(5000, _auto_refresh_all)
+    
     # 首次启动: 自动 ping 更新状态点
     try:
         root.after(500, _do_ping)
     except Exception:
         pass
 
-    # 底部状态栏 (Notebook 外面, 三个 Tab 共享)
+    # 底部状态栏 (Notebook 外面, 四个 Tab 共享)
     status_f = tk.Frame(root, bg="#ffffff", bd=1, relief="solid")
     status_f.pack(fill="x", padx=14, pady=(0, 14))
     tk.Label(status_f,

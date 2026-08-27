@@ -44,6 +44,7 @@ BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
 CHAT_QUEUE_FILE = os.path.join(DATA_DIR, "chat_queue.json")
 ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
 KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
+VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
@@ -372,6 +373,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/chat/queue":
             return self._chat_queue(getattr(self, "_auth_cache", None))
+        if path == "/api/players/names":
+            return self._players_names()
         self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
@@ -421,6 +424,15 @@ class APIHandler(BaseHTTPRequestHandler):
         # ---- /api/chat/queue  (查看当前队列, 调试用) ----
         if path == "/api/chat/queue":
             return self._chat_queue(auth)
+        # ---- /api/vote/kick (Bridge 发起投票) ----
+        if path == "/api/vote/kick":
+            return self._vote_kick(body)
+        # ---- /api/vote/cast (Bridge 投票) ----
+        if path == "/api/vote/cast":
+            return self._vote_cast(body)
+        # ---- /api/vote/status (Bridge 查看投票状态) ----
+        if path == "/api/vote/status":
+            return self._vote_status()
 
         # ---- 管理员 API ----
         if path.startswith("/api/admin/"):
@@ -1048,6 +1060,89 @@ class APIHandler(BaseHTTPRequestHandler):
             data = []
         return self._json(200, {"ok": True, "data": data})
 
+    def _players_names(self):
+        """Return only online player names (public, no auth needed)"""
+        try:
+            with FILE_LOCK:
+                data = readJsonFile(ONLINE_FILE) or []
+        except Exception:
+            data = []
+        if not isinstance(data, list):
+            data = []
+        names = [p.get("name", "") for p in data if isinstance(p, dict) and p.get("name")]
+        return self._json(200, {"ok": True, "data": names})
+
+    def _vote_kick(self, body):
+        """Bridge 发起投票踢出 → 写入 vote_queue.json, Lua 轮询处理"""
+        target_name = (body.get("target_name") or "").strip()
+        initiator_name = (body.get("initiator_name") or "").strip()
+        reason = (body.get("reason") or "").strip()
+        if not target_name:
+            return self._json(400, {"ok": False, "error": "需要 target_name (目标玩家名)"})
+        if not initiator_name:
+            return self._json(400, {"ok": False, "error": "需要 initiator_name (发起人名字)"})
+
+        now = int(time.time())
+        entry = {
+            "action": "kick",
+            "target_name": target_name,
+            "initiator_name": initiator_name,
+            "reason": reason,
+            "timestamp": now,
+            "processed": False,
+        }
+        with FILE_LOCK:
+            queue = readJsonFile(VOTE_QUEUE_FILE) or []
+            if not isinstance(queue, list):
+                queue = []
+            queue.append(entry)
+            writeJsonFile(VOTE_QUEUE_FILE, queue)
+
+        return self._json(200, {"ok": True, "msg": f"已发起对 {target_name} 的投票"})
+
+    def _vote_cast(self, body):
+        """Bridge 参与投票 → 写入 vote_queue.json, Lua 轮询处理"""
+        voter_name = (body.get("voter_name") or "").strip()
+        vote = (body.get("vote") or "").strip().lower()
+        if not voter_name:
+            return self._json(400, {"ok": False, "error": "需要 voter_name (投票人名字)"})
+        if vote not in ("yes", "y", "赞成", "no", "n", "反对"):
+            return self._json(400, {"ok": False, "error": "vote 必须是 yes/no"})
+
+        now = int(time.time())
+        entry = {
+            "action": "vote",
+            "voter_name": voter_name,
+            "vote": vote,
+            "timestamp": now,
+            "processed": False,
+        }
+        with FILE_LOCK:
+            queue = readJsonFile(VOTE_QUEUE_FILE) or []
+            if not isinstance(queue, list):
+                queue = []
+            queue.append(entry)
+            writeJsonFile(VOTE_QUEUE_FILE, queue)
+
+        return self._json(200, {"ok": True, "msg": f"已记录 {voter_name} 的投票"})
+
+    def _vote_status(self):
+        """Bridge 查询当前投票状态"""
+        try:
+            with FILE_LOCK:
+                data = readJsonFile(VOTE_QUEUE_FILE) or []
+        except Exception:
+            data = []
+        if not isinstance(data, list):
+            data = []
+        # 只返回最新的 kick 条目 (如果还未处理)
+        pending_kick = None
+        for e in reversed(data):
+            if isinstance(e, dict) and e.get("action") == "kick" and not e.get("processed"):
+                pending_kick = e
+                break
+        return self._json(200, {"ok": True, "pending_kick": pending_kick})
+
     def _admin_kick(self, body):
         """Add a player to the kick queue (Lua polls every 3s and drops them)"""
         player_id = body.get("playerID", body.get("player_id", body.get("pid")))
@@ -1228,7 +1323,7 @@ def _run_server(host, port, cfg):
 
 
 def main():
-    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS, ONLINE_FILE, KICK_QUEUE_FILE
+    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS, ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE
     p = argparse.ArgumentParser(description="BMPLogin HTTP API 服务器 (Bridge.exe 直连用)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=DEFAULT_API_PORT)
@@ -1250,6 +1345,7 @@ def main():
         BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
         ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
         KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
+        VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
         os.makedirs(DATA_DIR, exist_ok=True)
 
     if args.admins:

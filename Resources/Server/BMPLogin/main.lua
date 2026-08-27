@@ -11,6 +11,7 @@ local BANLIST_FILE = DATA_DIR .. "/banlist.json"
 local GUEST_MAP_FILE = DATA_DIR .. "/guest_map.json"
 local ONLINE_FILE = DATA_DIR .. "/online_players.json"
 local KICK_QUEUE_FILE = DATA_DIR .. "/kick_queue.json"
+local VOTE_QUEUE_FILE = DATA_DIR .. "/vote_queue.json"
 
 local accounts = {}
 local banlist = {}
@@ -1173,6 +1174,80 @@ local function _checkVoteKickTimeout()
     end
 end
 
+-- 从 vote_queue.json 读取 Bridge 发起的投票请求, 处理后标记 processed
+local function _processVoteQueue()
+    local f = io.open(VOTE_QUEUE_FILE, "r")
+    if not f then return end
+    local content = f:read("*all") or "[]"
+    f:close()
+    
+    local queue = jsonDecode(content)
+    if type(queue) ~= "table" or #queue == 0 then return end
+    
+    local changed = false
+    for _, entry in ipairs(queue) do
+        if entry and type(entry) == "table" and not entry.processed then
+            local action = entry.action
+            if action == "kick" then
+                -- Bridge 发起投票踢出
+                local targetName = entry.target_name or ""
+                local initiatorName = entry.initiator_name or ""
+                local reason = entry.reason or "Bridge 发起"
+                
+                -- 通过名字找到 playerID
+                local targetID = nil
+                local initiatorID = nil
+                for pid, info in pairs(onlinePlayers) do
+                    if info and info.name == targetName then targetID = pid end
+                    if info and info.name == initiatorName then initiatorID = pid end
+                end
+                
+                if targetID and initiatorID then
+                    local ok = _startVoteKick(initiatorID, targetID, reason)
+                    if ok then
+                        _broadcastVoteKick("投票由 Bridge 发起: " .. tostring(initiatorName) .. " → " .. tostring(targetName))
+                    end
+                else
+                    _broadcastVoteKick("投票请求被忽略: 玩家 " .. tostring(targetName) .. " 不在线")
+                end
+                entry.processed = true
+                changed = true
+                
+            elseif action == "vote" then
+                -- Bridge 投票
+                local voterName = entry.voter_name or ""
+                local voteValue = entry.vote or ""
+                
+                local voterID = nil
+                for pid, info in pairs(onlinePlayers) do
+                    if info and info.name == voterName then voterID = pid end
+                end
+                
+                if voterID and activeVoteKick then
+                    if voteValue == "yes" or voteValue == "y" or voteValue == "赞成" then
+                        _handleVote(voterID, "yes")
+                    elseif voteValue == "no" or voteValue == "n" or voteValue == "反对" then
+                        _handleVote(voterID, "no")
+                    end
+                end
+                entry.processed = true
+                changed = true
+            end
+        end
+    end
+    
+    if changed then
+        local fw = io.open(VOTE_QUEUE_FILE, "w")
+        if fw then
+            local ok, encoded = pcall(jsonEncode, queue)
+            if ok and encoded then
+                fw:write(encoded)
+            end
+            fw:close()
+        end
+    end
+end
+
 function _handleChat(playerID, playerName, message)
     
     local beamId = getPlayerStableInfo(playerID)
@@ -2133,6 +2208,9 @@ function processBanPollGlobal(eventName)
     
     -- 3.5) Vote kick timeout check
     _checkVoteKickTimeout()
+    
+    -- 3.6) Process Bridge vote queue (vote_queue.json)
+    _processVoteQueue()
     
     -- 4) Refresh online players JSON (update roles/vehicle counts)
     for pid, data in pairs(onlinePlayers) do
