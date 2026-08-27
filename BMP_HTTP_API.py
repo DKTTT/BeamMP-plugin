@@ -323,6 +323,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if path == "/api/chat/queue":
             return self._chat_queue(auth)
 
+        # ---- 管理员 API ----
+        if path.startswith("/api/admin/"):
+            return self._admin_route(auth, path, body)
+
         self._json(404, {"ok": False, "error": "not found: " + path})
 
     # ============= 业务实现 =============
@@ -654,19 +658,302 @@ class APIHandler(BaseHTTPRequestHandler):
             },
         })
 
+    # ============= 管理员 API =============
+    def _admin_route(self, auth, path, body):
+        """管理员路由分发 — 所有 /api/admin/* 端点"""
+        username = _validate_token(auth)
+        if not username:
+            return self._json(401, {"ok": False, "error": "未登录或 token 已过期"})
+        if not _is_admin(username):
+            return self._json(403, {"ok": False, "error": "非管理员, 无权访问"})
+
+        # 路由表
+        if path == "/api/admin/accounts":
+            return self._admin_list_accounts()
+        if path == "/api/admin/accounts/delete":
+            return self._admin_delete_account(body)
+        if path == "/api/admin/accounts/reset-password":
+            return self._admin_reset_password(body)
+        if path == "/api/admin/accounts/toggle-admin":
+            return self._admin_toggle_admin(body)
+        if path == "/api/admin/accounts/unbind":
+            return self._admin_unbind(body)
+        if path == "/api/admin/ban":
+            return self._admin_ban(body)
+        if path == "/api/admin/unban":
+            return self._admin_unban(body)
+        if path == "/api/admin/banlist":
+            return self._admin_banlist()
+        if path == "/api/admin/chat-queue":
+            return self._admin_chat_queue()
+        if path == "/api/admin/chat-queue/send":
+            return self._admin_chat_send(body)
+        if path == "/api/admin/chat-queue/clear":
+            return self._admin_chat_clear(body)
+        if path == "/api/admin/stats":
+            return self._admin_stats()
+
+        return self._json(404, {"ok": False, "error": "admin endpoint not found: " + path})
+
+    def _admin_list_accounts(self):
+        """列出所有账号 (脱敏密码 hash)"""
+        with FILE_LOCK:
+            accounts = loadAccounts()
+        result = []
+        for uname, acc in sorted(accounts.items()):
+            ph = acc.get("password_hash", "") or ""
+            ph_short = ph[:16] + "..." if len(ph) > 16 else ph
+            result.append({
+                "username": uname,
+                "is_admin": _is_admin(uname),
+                "bind_beam_ids": _ensure_list(acc.get("bind_beam_ids")),
+                "login_records_count": len(_ensure_list(acc.get("login_records"))),
+                "last_login": (_ensure_list(acc.get("login_records"))[-1].get("time")
+                              if _ensure_list(acc.get("login_records")) else None),
+                "password_hash_short": ph_short,
+                "register_time": acc.get("register_time"),
+            })
+        return self._json(200, {"ok": True, "data": result})
+
+    def _admin_delete_account(self, body):
+        target = (body.get("username") or "").strip()
+        if not target:
+            return self._json(400, {"ok": False, "error": "缺少 username"})
+        if target in ADMINS:
+            return self._json(400, {"ok": False, "error": f"不能删除管理员 {target}"})
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            if target not in accounts:
+                return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
+            del accounts[target]
+            saveAccounts(accounts)
+            # 同步清理 guestmap 里指向该账号的条目
+            gm = loadGuestMap()
+            cleaned = {k: v for k, v in gm.items()
+                      if not (isinstance(v, dict) and v.get("account") == target)}
+            saveGuestMap(cleaned)
+        return self._json(200, {"ok": True, "msg": f"账号 {target} 已删除"})
+
+    def _admin_reset_password(self, body):
+        target = (body.get("username") or "").strip()
+        new_pw = body.get("new_password") or ""
+        if not target or not new_pw:
+            return self._json(400, {"ok": False, "error": "需要 username 和 new_password"})
+        if len(new_pw) < 4:
+            return self._json(400, {"ok": False, "error": "密码至少 4 位"})
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            if target not in accounts:
+                return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
+            accounts[target]["password_hash"] = hashPassword(new_pw)
+            saveAccounts(accounts)
+        return self._json(200, {"ok": True, "msg": f"账号 {target} 密码已重置"})
+
+    def _admin_toggle_admin(self, body):
+        target = (body.get("username") or "").strip()
+        set_admin = bool(body.get("is_admin", False))
+        if not target:
+            return self._json(400, {"ok": False, "error": "缺少 username"})
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            if target not in accounts:
+                return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
+            if set_admin:
+                ADMINS.add(target)
+            else:
+                ADMINS.discard(target)
+        return self._json(200, {"ok": True, "msg": f"{target} 管理员权限: {'已开启' if set_admin else '已关闭'}",
+                               "data": {"is_admin": set_admin, "admins": sorted(ADMINS)}})
+
+    def _admin_unbind(self, body):
+        target = (body.get("username") or "").strip()
+        beam_id = (body.get("beam_id") or "").strip()
+        if not target or not beam_id:
+            return self._json(400, {"ok": False, "error": "需要 username 和 beam_id"})
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            if target not in accounts:
+                return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
+            bids = _ensure_list(accounts[target].get("bind_beam_ids"))
+            if beam_id not in bids:
+                return self._json(404, {"ok": False, "error": f"绑定 {beam_id} 不存在"})
+            bids.remove(beam_id)
+            accounts[target]["bind_beam_ids"] = bids
+            saveAccounts(accounts)
+            # 同步清理 guestmap
+            gm = loadGuestMap()
+            if beam_id in gm:
+                del gm[beam_id]
+                saveGuestMap(gm)
+        return self._json(200, {"ok": True, "msg": f"已解除 {target} 的绑定 {beam_id}"})
+
+    def _admin_ban(self, body):
+        target_type = (body.get("type") or "").strip()  # account / hwid / ip
+        target_val = (body.get("value") or "").strip()
+        reason = (body.get("reason") or "").strip()
+        if not target_type or not target_val:
+            return self._json(400, {"ok": False, "error": "需要 type(account/hwid/ip) 和 value"})
+        if target_type not in ("account", "hwid", "ip"):
+            return self._json(400, {"ok": False, "error": "type 必须是 account/hwid/ip"})
+        with FILE_LOCK:
+            banlist = loadBanlist()
+            key = target_type + "s"  # accounts / devices (复用 devices 存 hwid 和 ip)
+            if target_type == "account":
+                key = "accounts"
+            else:
+                key = "devices"
+            entry = {"value": target_val, "reason": reason, "time": int(time.time())}
+            banlist[key] = _ensure_list(banlist.get(key))
+            # 避免重复
+            existing_values = [e.get("value") if isinstance(e, dict) else e
+                               for e in banlist[key]]
+            if target_val not in existing_values:
+                banlist[key].append(entry)
+            writeJsonFile(BANLIST_FILE, banlist)
+        return self._json(200, {"ok": True, "msg": f"已封禁 {target_type}:{target_val}"})
+
+    def _admin_unban(self, body):
+        target_type = (body.get("type") or "").strip()
+        target_val = (body.get("value") or "").strip()
+        if not target_type or not target_val:
+            return self._json(400, {"ok": False, "error": "需要 type 和 value"})
+        with FILE_LOCK:
+            banlist = loadBanlist()
+            key = "accounts" if target_type == "account" else "devices"
+            items = _ensure_list(banlist.get(key))
+            new_items = [e for e in items
+                        if (e.get("value") if isinstance(e, dict) else e) != target_val]
+            banlist[key] = new_items
+            writeJsonFile(BANLIST_FILE, banlist)
+        return self._json(200, {"ok": True, "msg": f"已解封 {target_type}:{target_val}"})
+
+    def _admin_banlist(self):
+        with FILE_LOCK:
+            banlist = loadBanlist()
+        return self._json(200, {"ok": True, "data": banlist})
+
+    def _admin_chat_queue(self):
+        try:
+            with FILE_LOCK:
+                queue = readJsonFile(CHAT_QUEUE_FILE) or []
+        except Exception:
+            queue = []
+        items = queue if isinstance(queue, list) else []
+        return self._json(200, {
+            "ok": True,
+            "data": {
+                "total": len(items),
+                "unsent": len([x for x in items if not x.get("sent")]),
+                "items": items,
+            },
+        })
+
+    def _admin_chat_send(self, body):
+        """管理员以 [Admin] 前缀广播消息"""
+        msg = (body.get("message") or "").strip()
+        name = (body.get("player_name") or "管理员").strip()
+        if not msg:
+            return self._json(400, {"ok": False, "error": "message 不能为空"})
+        try:
+            with FILE_LOCK:
+                queue = readJsonFile(CHAT_QUEUE_FILE) or []
+                if not isinstance(queue, list):
+                    queue = []
+                item = {
+                    "id": secrets.token_hex(8),
+                    "ts": int(time.time()),
+                    "name": f"[Admin] {name}",
+                    "text": msg,
+                    "ip": "",
+                    "username": "admin",
+                    "sent": False,
+                }
+                queue.append(item)
+                if len(queue) > 200:
+                    queue = queue[-200:]
+                writeJsonFile(CHAT_QUEUE_FILE, queue)
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": "队列写入异常: " + str(e)})
+        return self._json(200, {"ok": True, "msg": "管理员消息已加入广播队列",
+                               "data": {"id": item["id"]}})
+
+    def _admin_chat_clear(self, body):
+        """清空聊天队列 (可选择只清已发送)"""
+        only_sent = bool(body.get("only_sent", False))
+        try:
+            with FILE_LOCK:
+                queue = readJsonFile(CHAT_QUEUE_FILE) or []
+                if only_sent:
+                    queue = [x for x in queue if not x.get("sent")]
+                else:
+                    queue = []
+                writeJsonFile(CHAT_QUEUE_FILE, queue)
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": "清空异常: " + str(e)})
+        return self._json(200, {"ok": True, "msg": f"已清空{'已发送消息' if only_sent else '全部队列'}"})
+
+    def _admin_stats(self):
+        """服务器统计信息"""
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            gm = loadGuestMap()
+            try:
+                banlist = loadBanlist()
+            except Exception:
+                banlist = {}
+        total_accounts = len(accounts)
+        admin_count = sum(1 for u in accounts if _is_admin(u))
+        auth_count = sum(1 for u, acc in accounts.items()
+                        if any(b.startswith(("HWID:", "IP:", "NAME:"))
+                               for b in _ensure_list(acc.get("bind_beam_ids"))))
+        # 最近 24h 活跃账号
+        now = int(time.time())
+        active_24h = 0
+        for u, acc in accounts.items():
+            recs = _ensure_list(acc.get("login_records"))
+            if recs and recs[-1].get("time", 0) > now - 86400:
+                active_24h += 1
+        # 聊天队列
+        try:
+            queue = readJsonFile(CHAT_QUEUE_FILE) or []
+            queue_total = len(queue) if isinstance(queue, list) else 0
+            queue_unsent = len([x for x in (queue if isinstance(queue, list) else []) if not x.get("sent")])
+        except Exception:
+            queue_total = 0
+            queue_unsent = 0
+        return self._json(200, {
+            "ok": True,
+            "data": {
+                "total_accounts": total_accounts,
+                "admin_count": admin_count,
+                "authenticated_count": auth_count,
+                "active_24h": active_24h,
+                "guestmap_entries": len(gm),
+                "ban_accounts": len(_ensure_list(banlist.get("accounts"))),
+                "ban_devices": len(_ensure_list(banlist.get("devices"))),
+                "chat_queue_total": queue_total,
+                "chat_queue_unsent": queue_unsent,
+                "admins": sorted(ADMINS),
+                "uptime_since": getattr(self.server, "start_time", None),
+            },
+        })
+
 
 def _run_server(host, port, cfg):
     httpd = HTTPServer((host, port), APIHandler)
     httpd.cfg = cfg
+    httpd.start_time = int(time.time())
     print(f"[{VERSION}] 监听 {host}:{port}")
     print(f"  数据目录: {DATA_DIR}")
     print(f"  管理员名单: {sorted(ADMINS) if ADMINS else '(空)'}")
     if cfg.get("allow_subnets"):
         print(f"  IP 白名单: {[str(n) for n in cfg['allow_subnets']]}")
-    print("  API:  POST /api/auth/{register,login,logout,whoami}")
-    print("        POST /api/hwid/bind")
-    print("        POST /api/vehicle/limit")
-    print("        GET  /api/ping")
+    print("  玩家 API:  POST /api/auth/{register,login,logout,whoami}")
+    print("             POST /api/hwid/bind  /api/vehicle/limit")
+    print("             POST /api/chat/send   GET  /api/ping")
+    print("  管理员 API: POST /api/admin/accounts (列表/删除/重置密码/设管理员/解绑)")
+    print("             POST /api/admin/ban /unban /banlist")
+    print("             POST /api/admin/chat-queue/send /clear  GET /api/admin/stats")
     print()
     try:
         httpd.serve_forever()
