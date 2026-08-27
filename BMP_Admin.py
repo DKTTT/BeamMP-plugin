@@ -14,7 +14,7 @@
 =====================================================================
 """
 
-import json, os, sys, time, tkinter as tk
+import json, os, sys, time, hashlib, tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import urllib.request, urllib.error
 from datetime import datetime
@@ -42,10 +42,18 @@ def _load_cfg():
     except Exception:
         pass
 
+def _hash_token(tok):
+    """本地存储时只存 token hash"""
+    if not tok: return ""
+    return hashlib.sha256(tok.encode()).hexdigest()
+
 def _save_cfg():
     try:
+        save_data = dict(CFG)
+        if save_data.get("access_token"):
+            save_data["_token_hash"] = _hash_token(save_data.pop("access_token"))
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(CFG, f, ensure_ascii=False, indent=2)
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 

@@ -54,6 +54,60 @@ CHAT_RATE_LIMIT = {}
 CHAT_RATE_WINDOW = 60   # 60 秒
 CHAT_RATE_MAX = 6        # 最多 6 条/分钟
 
+# ---- 登录速率限制 ----
+LOGIN_RATE = {}          # key: "ip:username" -> [timestamps]
+LOGIN_RATE_WINDOW = 300  # 5 分钟窗口
+LOGIN_RATE_MAX = 5       # 每 5 分钟最多 5 次登录尝试
+LOGIN_LOCKOUT_SECONDS = 600  # 超限后锁定 10 分钟
+
+# ---- 请求体限制 ----
+MAX_BODY_SIZE = 65536    # 64 KB (JSON body)
+
+# ---- 管理员审计日志 ----
+ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "admin_audit.jsonl")
+
+def _audit_log(action, admin, target="", detail=""):
+    """管理员操作审计 — 追加写入 JSONL (每行一条, 不截断)"""
+    try:
+        entry = {
+            "ts": int(time.time()),
+            "action": action,
+            "admin": admin,
+            "target": target,
+            "detail": detail,
+            "ip": "",
+        }
+        with FILE_LOCK:
+            with open(ADMIN_AUDIT_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _check_login_rate(ip, username):
+    """检查登录速率限制, 返回 (允许, 剩余秒数)"""
+    key = f"{ip}:{username}"
+    now = int(time.time())
+    # 清理过期记录
+    if key in LOGIN_RATE:
+        LOGIN_RATE[key] = [t for t in LOGIN_RATE[key] if now - t < LOGIN_RATE_WINDOW]
+    else:
+        LOGIN_RATE[key] = []
+    recent = LOGIN_RATE[key]
+    if len(recent) >= LOGIN_RATE_MAX:
+        oldest = recent[0]
+        wait = LOGIN_LOCKOUT_SECONDS - (now - oldest)
+        return False, max(0, wait)
+    return True, 0
+
+def _record_login_attempt(ip, username):
+    key = f"{ip}:{username}"
+    LOGIN_RATE.setdefault(key, [])
+    LOGIN_RATE[key].append(int(time.time()))
+    # 防止字典无限增长
+    if len(LOGIN_RATE) > 10000:
+        for k in list(LOGIN_RATE.keys())[:5000]:
+            del LOGIN_RATE[k]
+
 # ============================================================
 #  JSON 数组兼容 (与 main.lua Array metatable 一致: 空表是 [])
 # ============================================================
@@ -243,6 +297,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
+        # 安全头
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-XSS-Protection", "1; mode=block")
+        self.send_header("Cache-Control", "no-store")
+        # CORS — 管理员 API 内部调, 通配只限玩家 API
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-HWID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -254,6 +314,10 @@ class APIHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or "0")
         except Exception:
             length = 0
+        if length > MAX_BODY_SIZE:
+            # 拒绝超大请求
+            self._json(413, {"ok": False, "error": f"请求体过大 (最大 {MAX_BODY_SIZE} 字节)"})
+            return None
         raw = self.rfile.read(length) if length > 0 else b""
         if not raw: return {}
         try:
@@ -373,22 +437,32 @@ class APIHandler(BaseHTTPRequestHandler):
         hwid = (body.get("hwid") or "").strip()
         ip = (body.get("ip") or "").strip()
         player_name = (body.get("player_name") or "").strip()
+        client_ip = self.client_address[0]
 
-        # DEBUG: 打印收到的登录请求 (长度+repr, 不泄露真实内容)
-        _log_login = f"[DBG-LOGIN] user={username!r} pwd_len={len(password)} pwd_repr={repr(password[:3]+'***'+password[-3:]) if len(password)>=6 else repr(password)} hwid_len={len(hwid)}"
-        print(_log_login, flush=True)
+        # ---- 登录速率限制 (防暴力破解) ----
+        if username:
+            allowed, wait = _check_login_rate(client_ip, username)
+            if not allowed:
+                return self._json(429, {
+                    "ok": False,
+                    "msg": f"登录尝试过多, 请 {wait} 秒后再试",
+                    "retry_after": wait,
+                })
 
         with FILE_LOCK:
             accounts = loadAccounts()
             acc = accounts.get(username)
             if not acc:
-                print(f"[DBG-LOGIN] 账号不存在: {username}", flush=True)
-                return self._json(200, {"ok": False, "msg": f"账号 {username} 不存在"})
+                # 账号不存在也记录 (防止枚举, 但记录登录失败次数)
+                if username:
+                    _record_login_attempt(client_ip, username)
+                return self._json(200, {"ok": False, "msg": "账号或密码不正确"})
             stored_hash = acc.get("password_hash") or ""
             ok_pwd = verifyPassword(password, stored_hash)
-            print(f"[DBG-LOGIN] stored_hash_len={len(stored_hash)} verifyResult={ok_pwd}", flush=True)
             if not ok_pwd:
-                return self._json(200, {"ok": False, "msg": "密码不正确"})
+                # 密码错误 — 记录尝试
+                _record_login_attempt(client_ip, username)
+                return self._json(200, {"ok": False, "msg": "账号或密码不正确"})
 
             bids = _normalize_beam_ids(hwid, ip, player_name)
             bound = acc.get("bind_beam_ids") or []
@@ -410,17 +484,26 @@ class APIHandler(BaseHTTPRequestHandler):
                 "name": player_name,
                 "via": "HTTP-API",
             })
-            acc["login_records"] = records[-100:]  # 最多 100 条
+            acc["login_records"] = records[-100:]
             saveAccounts(accounts)
 
-            # 更新 guestmap (自动登录用, 与 main.lua 共享)
+            # 更新 guestmap
             if bids:
                 gm = loadGuestMap()
                 for b in bids:
                     gm[b] = {"account": username, "last_seen": int(time.time())}
                 saveGuestMap(gm)
 
+        # 登录成功 — 清空速率限制记录
+        if username and username in LOGIN_RATE:
+            LOGIN_RATE.pop(f"{client_ip}:{username}", None)
+
         token = _issue_token(username)
+
+        # 管理员登录审计
+        if _is_admin(username):
+            _audit_log("admin_login", username, detail=f"ip={client_ip} hwid={hwid}")
+
         return self._json(200, {
             "ok": True,
             "msg": f"登录成功, 欢迎回来 {username}",
@@ -666,29 +749,56 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._json(401, {"ok": False, "error": "未登录或 token 已过期"})
         if not _is_admin(username):
             return self._json(403, {"ok": False, "error": "非管理员, 无权访问"})
+        client_ip = self.client_address[0]
 
         # 路由表
         if path == "/api/admin/accounts":
             return self._admin_list_accounts()
         if path == "/api/admin/accounts/delete":
+            _audit_log("admin_delete_account", username,
+                       target=(body or {}).get("username", ""),
+                       detail=f"ip={client_ip}")
             return self._admin_delete_account(body)
         if path == "/api/admin/accounts/reset-password":
+            _audit_log("admin_reset_password", username,
+                       target=(body or {}).get("username", ""),
+                       detail=f"ip={client_ip}")
             return self._admin_reset_password(body)
         if path == "/api/admin/accounts/toggle-admin":
+            is_admin = (body or {}).get("is_admin", False)
+            _audit_log("admin_toggle_admin", username,
+                       target=(body or {}).get("username", ""),
+                       detail=f"set={is_admin} ip={client_ip}")
             return self._admin_toggle_admin(body)
         if path == "/api/admin/accounts/unbind":
+            _audit_log("admin_unbind", username,
+                       target=(body or {}).get("username", ""),
+                       detail=f"beam_id={(body or {}).get('beam_id','')} ip={client_ip}")
             return self._admin_unbind(body)
         if path == "/api/admin/ban":
+            _audit_log("admin_ban", username,
+                       target=f"{(body or {}).get('type','')}:{(body or {}).get('value','')}",
+                       detail=f"reason={(body or {}).get('reason','')} ip={client_ip}")
             return self._admin_ban(body)
         if path == "/api/admin/unban":
+            _audit_log("admin_unban", username,
+                       target=f"{(body or {}).get('type','')}:{(body or {}).get('value','')}",
+                       detail=f"ip={client_ip}")
             return self._admin_unban(body)
         if path == "/api/admin/banlist":
             return self._admin_banlist()
         if path == "/api/admin/chat-queue":
             return self._admin_chat_queue()
         if path == "/api/admin/chat-queue/send":
+            _audit_log("admin_chat_send", username,
+                       target=(body or {}).get("player_name", ""),
+                       detail=f"msg_len={len((body or {}).get('message',''))} ip={client_ip}")
             return self._admin_chat_send(body)
         if path == "/api/admin/chat-queue/clear":
+            only_sent = (body or {}).get("only_sent", False)
+            _audit_log("admin_chat_clear", username,
+                       target="",
+                       detail=f"only_sent={only_sent} ip={client_ip}")
             return self._admin_chat_clear(body)
         if path == "/api/admin/stats":
             return self._admin_stats()
@@ -943,17 +1053,38 @@ def _run_server(host, port, cfg):
     httpd = HTTPServer((host, port), APIHandler)
     httpd.cfg = cfg
     httpd.start_time = int(time.time())
-    print(f"[{VERSION}] 监听 {host}:{port}")
+
+    # ---- TLS/HTTPS 支持 ----
+    tls_cert = cfg.get("tls_cert")
+    tls_key = cfg.get("tls_key")
+    if tls_cert and tls_key:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            print(f"[{VERSION}] 监听 {host}:{port}  (🔒 HTTPS/TLS)")
+        except Exception as e:
+            print(f"[!] TLS 启动失败, 回退到 HTTP: {e}")
+            print(f"[{VERSION}] 监听 {host}:{port}")
+    else:
+        print(f"[{VERSION}] 监听 {host}:{port}")
+        print("  ⚠️  未启用 TLS — 公网部署建议配置 --tls-cert / --tls-key")
+
     print(f"  数据目录: {DATA_DIR}")
     print(f"  管理员名单: {sorted(ADMINS) if ADMINS else '(空)'}")
     if cfg.get("allow_subnets"):
         print(f"  IP 白名单: {[str(n) for n in cfg['allow_subnets']]}")
+    if tls_cert and tls_key:
+        print(f"  TLS 证书: {tls_cert}")
     print("  玩家 API:  POST /api/auth/{register,login,logout,whoami}")
     print("             POST /api/hwid/bind  /api/vehicle/limit")
     print("             POST /api/chat/send   GET  /api/ping")
     print("  管理员 API: POST /api/admin/accounts (列表/删除/重置密码/设管理员/解绑)")
     print("             POST /api/admin/ban /unban /banlist")
     print("             POST /api/admin/chat-queue/send /clear  GET /api/admin/stats")
+    print("  审计日志:  bmp_login/admin_audit.jsonl")
     print()
     try:
         httpd.serve_forever()
@@ -971,6 +1102,10 @@ def main():
                    help="逗号分隔的 IP/CIDR, 不填=允许所有. 例: 127.0.0.1,192.168.0.0/24,110.x.x.x/32")
     p.add_argument("--admins", default="",
                    help="逗号分隔管理员账号, 例: DRIFTKING,seeyou   (车辆 999 辆上限)")
+    p.add_argument("--tls-cert", default="",
+                   help="TLS 证书文件 (PEM), 启用 HTTPS")
+    p.add_argument("--tls-key", default="",
+                   help="TLS 私钥文件 (PEM), 启用 HTTPS")
     args = p.parse_args()
 
     if args.data_dir:
@@ -999,6 +1134,9 @@ def main():
                 print(f"[WARN] 跳过无效的白名单条目 {tok}: {e}")
 
     cfg = {"allow_subnets": allow_subnets}
+    if args.tls_cert and args.tls_key:
+        cfg["tls_cert"] = os.path.abspath(args.tls_cert)
+        cfg["tls_key"] = os.path.abspath(args.tls_key)
     _run_server(args.host, args.port, cfg)
 
 

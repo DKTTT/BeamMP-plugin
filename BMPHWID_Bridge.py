@@ -48,10 +48,19 @@ try:
 except Exception:
     CFG = {}
 
+def _hash_token(tok):
+    """本地存储时只存 token 的 SHA-256 hash, 防止被直接读取冒用"""
+    if not tok: return ""
+    return hashlib.sha256(tok.encode()).hexdigest()
+
 def _save_cfg():
     try:
+        # 只存 token hash, 不存明文
+        save_data = dict(CFG)
+        if save_data.get("access_token"):
+            save_data["_token_hash"] = _hash_token(save_data.pop("access_token"))
         with open(_get_cfg_path(), "w", encoding="utf-8") as _f:
-            json.dump(CFG, _f, ensure_ascii=False, indent=2)
+            json.dump(save_data, _f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
