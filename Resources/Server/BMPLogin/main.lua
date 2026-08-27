@@ -889,7 +889,12 @@ function onChatMessage(playerID, playerName, message)
     if not isCommand then
         local beamId = getPlayerStableInfo(playerID)
         if beamId and isPlayerAuthenticated(playerID) then
-            MP.SendChatMessage(-1, " [授信用户] " .. playerName .. ": " .. message)
+            -- 用账号名 (如果已登录) 代替 guest 名
+            local displayName = playerName
+            if playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].bound_account then
+                displayName = playerAuthCache[playerID].bound_account
+            end
+            MP.SendChatMessage(-1, " [授信用户] " .. displayName .. ": " .. message)
             return 1  -- 拦截原消息, 用带前缀的替代
         end
     end
