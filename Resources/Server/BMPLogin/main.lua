@@ -5,7 +5,7 @@
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.4.0"
+local PLUGIN_VERSION = "3.5.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -13,6 +13,7 @@ local GUEST_MAP_FILE = DATA_DIR .. "/guest_map.json"
 local ONLINE_FILE = DATA_DIR .. "/online_players.json"
 local KICK_QUEUE_FILE = DATA_DIR .. "/kick_queue.json"
 local VOTE_QUEUE_FILE = DATA_DIR .. "/vote_queue.json"
+local BINDINGS_FILE = DATA_DIR .. "/bindings.json"    -- 机器码 ↔ 官方账号 的绑定证据
 
 -- ============================================================
 -- 认证模式开关  ★ 部署前先看这里 ★
@@ -636,6 +637,82 @@ end
 
 local function saveGuestMap()
     writeJsonFile(GUEST_MAP_FILE, guestAccountMap)
+end
+
+-- ============================================================
+-- 机器码 ↔ BeamMP 官方账号 绑定证据 (bindings.json)
+--
+--   为什么需要这张表:
+--     网页注册时要用机器码证明"确实是这个游戏账号的本人"。
+--     但机器码本身不是秘密 —— 它在网页面板/在线列表里是公开的,
+--     谁抄走了都能拿去注册。真正靠得住的证据只有一种:
+--     **服务器亲眼看到这个机器码和这个官方账号同时在线过**。
+--
+--   结构: { "<hwid>": { beammp_id, player_name, first_seen, last_seen, seen } }
+--   写入频率做了节流, 不会每次上报都刷盘。
+-- ============================================================
+local bindings = {}
+local bindingsDirty = false
+local lastBindingsSave = 0
+local BINDINGS_SAVE_INTERVAL = 15   -- 秒
+
+local function loadBindings()
+    local data = readJsonFile(BINDINGS_FILE)
+    if type(data) == "table" then
+        bindings = data
+    else
+        bindings = {}
+    end
+    local n = 0
+    for _ in pairs(bindings) do n = n + 1 end
+    print("[BMP Login] 机器码↔账号 绑定记录: " .. n)
+end
+
+local function flushBindings(force)
+    if not bindingsDirty then return end
+    local now = os.time()
+    if not force and (now - lastBindingsSave) < BINDINGS_SAVE_INTERVAL then return end
+    lastBindingsSave = now
+    bindingsDirty = false
+    writeJsonFile(BINDINGS_FILE, bindings)
+end
+
+-- 记录一次「我亲眼看到 hwid 与 beammpId 同时在线」
+function recordBinding(playerID, hwid, playerName)
+    if not hwid or hwid == "" then return end
+    -- 注意: 不能调用后面才定义的 getPlayerBeammpId (会变成全局查找 -> nil),
+    -- 这里直接读缓存, 等价且没有顺序问题
+    local ac = playerAuthCache and playerAuthCache[playerID]
+    -- 只记「登录了官方账号」的人: 游客也有 identifiers.beammp (是 guest id),
+    -- 记下来就等于给游客发了一张"已验证"的门票。
+    if not (ac and ac.official_account == true) then return end
+    local beammpId = ac.beammp_id
+    if not beammpId or beammpId == "" then
+        local bid = ac.auth_beam_id
+        if type(bid) == "string" then beammpId = bid:match("^BEAMMP:(.+)$") end
+    end
+    if not beammpId or beammpId == "" then return end
+
+    hwid = tostring(hwid):lower()
+    local now = os.time()
+    local e = bindings[hwid]
+    if type(e) ~= "table" then
+        e = { beammp_id = beammpId, player_name = playerName or "", first_seen = now,
+              last_seen = now, seen = 0 }
+        bindings[hwid] = e
+    else
+        -- 换号: 以最近的账号为准, 但保留变更次数, 便于人工识别一人多号
+        if e.beammp_id ~= beammpId then
+            e.prev_beammp_id = e.beammp_id
+            e.beammp_id = beammpId
+        end
+        e.player_name = playerName or e.player_name or ""
+        e.last_seen = now
+    end
+    e.seen = (e.seen or 0) + 1
+    bindingsDirty = true
+    logDebug("binding: hwid=" .. hwid .. " <-> beammp=" .. beammpId .. " seen=" .. e.seen)
+    flushBindings(false)
 end
 
 -- ============================================================
@@ -1918,6 +1995,9 @@ function onInit()
     pcall(function()
         loadGuestMap()
     end)
+    pcall(function()
+        loadBindings()
+    end)
     
     -- Register all events (BeamMP v3.9.3 requires MP.RegisterEvent with 2 params)
     pcall(function()
@@ -2252,6 +2332,7 @@ function onPlayerDisconnect(playerID)
     playerPositions[playerID] = nil
 
     _saveOnlinePlayers()
+    pcall(function() flushBindings(true) end)   -- 玩家走时把绑定证据落盘
 
     -- 人数以删完之后重新数为准。
     -- 以前是"先数一遍再 -1": 如果这个玩家根本没进过 onlinePlayers
@@ -2827,6 +2908,7 @@ local function processHwidPayload(playerID, playerName, payload)
     
     -- Pick the most stable HWID key for auto-login binding
     local bestHwid = nil
+    local bestHwidValue = nil      -- 纯净的机器码值 (不带 "key:" 前缀), 网页端比对用
     local priority_keys = {
         "settings.BMPLoginHWID(uuid)",   -- 1) Our persistent UUID (best)
         "uuid",                           -- 2) Any other UUID
@@ -2838,6 +2920,7 @@ local function processHwidPayload(playerID, playerName, payload)
     for _, k in ipairs(priority_keys) do
         if hwidData[k] and hwidData[k] ~= "" then
             bestHwid = k .. ":" .. hwidData[k]
+            bestHwidValue = hwidData[k]
             break
         end
     end
@@ -2864,6 +2947,10 @@ local function processHwidPayload(playerID, playerName, payload)
         pcall(function()
             MP.SendChatMessage(playerID, " HWID已接收: 绑定 " .. bestHwid:sub(1, 32) .. "...")
         end)
+
+        -- 记录「机器码 ↔ BeamMP 官方账号」的绑定证据 (网站注册时用它验证本人)
+        -- 传纯净的 UUID, 不是 "key:value" 串 —— 网页端拿到的 /hwid 就是纯净值
+        recordBinding(playerID, bestHwidValue, playerName)
     else
         print("[BMP Login] [HWID] 解析后的字段中没有可用 HWID")
         pcall(function()

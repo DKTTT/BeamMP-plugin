@@ -40,6 +40,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("BMP_DATA_DIR") or os.path.join(_HERE, "bmp_login")
 ACCOUNTS_FILE = GUESTMAP_FILE = BANLIST_FILE = CHAT_QUEUE_FILE = None
 ONLINE_FILE = KICK_QUEUE_FILE = VOTE_QUEUE_FILE = ADMIN_AUDIT_FILE = None
+BINDINGS_FILE = None
 
 
 class DataFileError(RuntimeError):
@@ -51,7 +52,7 @@ def _set_data_dir(path):
     以前 --data-dir 只改了 6 个路径, 漏了 chat_queue.json / admin_audit.jsonl,
     导致 Bridge 聊天写进旧目录, Lua 插件永远读不到 (聊天完全不广播)。"""
     global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, CHAT_QUEUE_FILE
-    global ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE, ADMIN_AUDIT_FILE
+    global ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE, ADMIN_AUDIT_FILE, BINDINGS_FILE
     DATA_DIR = os.path.abspath(path)
     os.makedirs(DATA_DIR, exist_ok=True)
     ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
@@ -62,13 +63,14 @@ def _set_data_dir(path):
     KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
     VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
     ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "admin_audit.jsonl")
+    BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")
 
 
 _set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.4.0"
+VERSION = "BMP-HTTP/v1.5.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -497,6 +499,12 @@ class APIHandler(BaseHTTPRequestHandler):
         # 网页面板: 浏览器直接打开 http://<服务器IP>:12124/
         if path in ("/", "/index.html", "/panel"):
             return self._serve_panel()
+        if path in ("/account", "/register"):
+            return self._serve_static("account.html")
+        if path == "/api/bng/verify":
+            return self._bng_verify()
+        if path == "/api/chat/log":
+            return self._chat_log()
         if path in ("/api/players/live", "/api/players/online"):
             return self._players_live(getattr(self, "_auth_cache", None))
         if path == "/api/chat/queue":
@@ -567,6 +575,14 @@ class APIHandler(BaseHTTPRequestHandler):
         # ---- /api/vote/cast (Bridge 投票) ----
         if path == "/api/vote/cast":
             return self._vote_cast(auth, body)
+
+        # ---- 网站账号: BNG 官方账号 + 机器码 ----
+        if path == "/api/account/register":
+            return self._account_register(body)
+        if path == "/api/account/login":
+            return self._account_login(body)
+        if path == "/api/account/login-hwid":
+            return self._account_login_hwid(body)
 
         # ---- 管理员 API ----
         if path.startswith("/api/admin/"):
@@ -1234,14 +1250,17 @@ class APIHandler(BaseHTTPRequestHandler):
     # ============= 网页面板 =============
     def _serve_panel(self):
         """把 panel.html 原样返回 (与 BMP_HTTP_API.py 放在同一目录)."""
+        return self._serve_static("panel.html")
+
+    def _serve_static(self, name):
         here = os.path.dirname(os.path.abspath(__file__))
-        p = os.path.join(here, "panel.html")
+        p = os.path.join(here, name)
         try:
             with open(p, "rb") as f:
                 body = f.read()
         except OSError:
             self._json(404, {"ok": False,
-                             "error": "找不到 panel.html, 请把它和 BMP_HTTP_API.py 放在同一目录"})
+                             "error": f"找不到 {name}, 请把它和 BMP_HTTP_API.py 放在同一目录"})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1250,6 +1269,229 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
+
+    # ============= BNG 账号: 绑定证据 / 注册 / 登录 =============
+    def _load_bindings(self):
+        """读 Lua 写的 bindings.json: { hwid: {beammp_id, player_name, first_seen, last_seen, seen} }"""
+        try:
+            with FILE_LOCK:
+                data = readJsonFile(BINDINGS_FILE)
+        except Exception:
+            data = None
+        return data if isinstance(data, dict) else {}
+
+    def _online_rows(self):
+        try:
+            with FILE_LOCK:
+                data = readJsonFile(ONLINE_FILE)
+        except Exception:
+            data = None
+        return data if isinstance(data, list) else []
+
+    def _online_hwid_map(self):
+        """当前在线玩家的 hwid -> 在线条目 (用于"本人在线"验证)"""
+        out = {}
+        for p in self._online_rows():
+            if isinstance(p, dict):
+                h = (p.get("hwid") or "").strip().lower()
+                if h:
+                    out[h] = p
+        return out
+
+    def _bng_verify(self):
+        """GET /api/bng/verify?hwid=xxx
+
+        返回这个机器码在服务器上被观察到与哪个 BeamMP 官方账号同时在线过。
+        网页注册页用它来显示"已检测到你的账号 ✓"。
+        """
+        qs = parse_qs(urlparse(self.path).query)
+        hwid = (qs.get("hwid", [""])[0] or "").strip().lower()
+        if not hwid:
+            return self._json(400, {"ok": False, "error": "缺少 hwid 参数"})
+
+        bindings = self._load_bindings()
+        rec = bindings.get(hwid)
+        online = self._online_hwid_map().get(hwid)
+
+        if not isinstance(rec, dict) and not online:
+            return self._json(200, {"ok": True, "data": {
+                "bound": False, "online": False,
+                "msg": "服务器还没见过这个机器码。请先进一次服务器（保持 BMPHWID_Bridge 运行），再回来注册。",
+            }})
+
+        rec = rec if isinstance(rec, dict) else {}
+        data = {
+            "bound": bool(rec.get("beammp_id")),
+            "online": online is not None,
+            "beammp_id": rec.get("beammp_id", ""),
+            "player_name": rec.get("player_name", "") or (online or {}).get("name", ""),
+            "first_seen": rec.get("first_seen"),
+            "last_seen": rec.get("last_seen"),
+            "seen": rec.get("seen", 0),
+        }
+        if not data["beammp_id"]:
+            data["msg"] = "看到过这个机器码，但当时是游客（没登录官方账号）。请在 BeamMP 里登录官方账号后再进一次服务器。"
+        return self._json(200, {"ok": True, "data": data})
+
+    def _find_account_by_hwid(self, accounts, hwid):
+        hwid = (hwid or "").lower()
+        for uname, acc in accounts.items():
+            if isinstance(acc, dict) and (acc.get("hwid") or "").lower() == hwid:
+                return uname
+        return None
+
+    def _account_register(self, body):
+        """POST /api/account/register {username, password, hwid}
+
+        和老的 /api/auth/register 的区别: 这里的账号必须绑定一个**服务器亲眼见过**
+        的 (机器码 ↔ 官方账号) 组合, 否则拒绝 —— 防止随便编个账号来蹭授信。
+        """
+        username = _get_str(body, "username")
+        password = body.get("password")
+        hwid = _get_str(body, "hwid").lower()
+
+        if not re.match(r"^[A-Za-z0-9_]{3,20}$", username):
+            return self._json(200, {"ok": False, "msg": "账号名不合法 (3-20 字符, 字母/数字/下划线)"})
+        if not isinstance(password, str) or not (4 <= len(password) <= 64):
+            return self._json(200, {"ok": False, "msg": "密码不合法 (4-64 字符)"})
+        if not hwid:
+            return self._json(400, {"ok": False, "msg": "缺少机器码 (请先启动 BMPHWID_Bridge)"})
+
+        bindings = self._load_bindings()
+        rec = bindings.get(hwid)
+        if not isinstance(rec, dict) or not rec.get("beammp_id"):
+            return self._json(403, {"ok": False,
+                                    "msg": "服务器还没见过这个机器码与官方账号一起在线。"
+                                           "请先在游戏里登录 BeamMP 官方账号并进一次服务器。",
+                                    "data": {"hwid": hwid, "need_ingame": True}})
+        beammp_id = rec["beammp_id"]
+
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            if accounts.get(username):
+                return self._json(200, {"ok": False, "msg": f"账号 {username} 已存在"})
+            owner = self._find_account_by_hwid(accounts, hwid)
+            if owner and owner != username:
+                return self._json(409, {"ok": False,
+                                        "msg": f"这个机器码已经绑定了账号 {owner}"})
+            acc = {
+                "username": username,
+                "password_hash": hashPassword(password),
+                "register_time": int(time.time()),
+                "bind_beam_ids": [],
+                "login_records": [],
+                "hwid": hwid,
+                "beammp_id": beammp_id,
+                "beammp_name": rec.get("player_name", ""),
+                "verified": True,
+                "verified_at": int(time.time()),
+                "via": "web-bng",
+            }
+            accounts[username] = acc
+            ok, err = saveAccounts(accounts)
+            if not ok:
+                return self._json(500, {"ok": False, "msg": f"保存失败: {err}"})
+
+        token = _issue_token(username)
+        _audit_log("account_register", username, target=username,
+                   detail=f"beammp_id={beammp_id} hwid={hwid[:8]}…")
+        return self._json(200, {
+            "ok": True,
+            "msg": f"注册成功！已绑定 BeamMP 官方账号 {beammp_id[:12]}…",
+            "data": {"username": username, "access_token": token, "ttl": ACCESS_TTL,
+                     "beammp_id": beammp_id, "hwid": hwid, "verified": True},
+        })
+
+    def _account_login(self, body):
+        """POST /api/account/login {username, password} —— 普通密码登录"""
+        username = _get_str(body, "username")
+        password = body.get("password")
+        if not username or not isinstance(password, str) or not password:
+            return self._json(200, {"ok": False, "msg": "账号或密码不正确"})
+
+        client_ip = self.client_address[0]
+        allowed, wait = _check_login_rate(client_ip, username)
+        if not allowed:
+            return self._json(429, {"ok": False, "msg": f"登录尝试过多, 请 {wait} 秒后再试"})
+
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            acc = accounts.get(username)
+            if not isinstance(acc, dict) or not verifyPassword(password, acc.get("password_hash") or ""):
+                _record_login_attempt(client_ip, username)
+                return self._json(200, {"ok": False, "msg": "账号或密码不正确"})
+        LOGIN_RATE.pop(f"{client_ip}:{username}", None)
+
+        token = _issue_token(username)
+        return self._json(200, {
+            "ok": True,
+            "msg": f"登录成功, 欢迎回来 {username}",
+            "data": {"username": username, "access_token": token, "ttl": ACCESS_TTL,
+                     "verified": bool(acc.get("verified")),
+                     "beammp_id": acc.get("beammp_id", ""),
+                     "hwid": acc.get("hwid", ""),
+                     "is_admin": _is_admin(username)},
+        })
+
+    def _account_login_hwid(self, body):
+        """POST /api/account/login-hwid {hwid} —— 一键登录
+
+        双重条件, 两个都必须满足:
+          1. 这个机器码绑定过某个账号 (注册时验证过)
+          2. 这个机器码**此刻就在服务器里在线**
+        所以就算别人抄到了机器码 (它在面板上是公开的), 只要他人的机器不在线,
+        也登不进来 —— "本人在线" 才是凭证。
+        """
+        hwid = _get_str(body, "hwid").lower()
+        if not hwid:
+            return self._json(400, {"ok": False, "msg": "缺少机器码"})
+
+        online = self._online_hwid_map()
+        row = online.get(hwid)
+        if not row:
+            return self._json(403, {"ok": False,
+                                    "msg": "这个机器码当前不在线。请先进服务器（保持 BMPHWID_Bridge 运行）再试。",
+                                    "data": {"need_ingame": True}})
+
+        with FILE_LOCK:
+            accounts = loadAccounts()
+            username = self._find_account_by_hwid(accounts, hwid)
+            if not username:
+                return self._json(404, {"ok": False, "msg": "这个机器码还没有注册账号, 请先注册"})
+            acc = accounts[username]
+
+        token = _issue_token(username)
+        return self._json(200, {
+            "ok": True,
+            "msg": f"已验证本人在线, 登录为 {username}",
+            "data": {"username": username, "access_token": token, "ttl": ACCESS_TTL,
+                     "verified": bool(acc.get("verified")),
+                     "beammp_id": acc.get("beammp_id", ""),
+                     "player_name": row.get("name", ""),
+                     "is_admin": _is_admin(username)},
+        })
+
+    def _chat_log(self):
+        """GET /api/chat/log?limit=50 —— 面板聊天记录 (最近 N 条, 含已发送的)"""
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            limit = max(1, min(200, int(qs.get("limit", ["50"])[0])))
+        except Exception:
+            limit = 50
+        try:
+            with FILE_LOCK:
+                queue = readJsonFile(CHAT_QUEUE_FILE)
+        except Exception:
+            queue = None
+        if not isinstance(queue, list):
+            queue = []
+        items = [x for x in queue if isinstance(x, dict)][-limit:]
+        return self._json(200, {"ok": True, "data": {
+            "items": [{"name": i.get("name", ""), "text": i.get("text", ""),
+                       "ts": i.get("ts"), "sent": bool(i.get("sent")),
+                       "username": i.get("username", "")} for i in items],
+            "server_time": int(time.time()),
+        }})
 
     def _players_live(self, auth):
         """网页面板的数据源: 直接读 Lua 写的 online_players.json.

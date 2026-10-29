@@ -297,6 +297,56 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 
 ## 📋 变更日志
 
+### v3.6.0 (2026-10-29) — BNG 官方账号网站注册 + 机器码验证 + 网页聊天
+
+新增 `account.html`（`http://<IP>:12124/account`）：**用 BeamMP 官方账号身份注册**，
+机器码只用来证明"是这个账号的本人"。
+
+**为什么机器码能证明本人（关键设计）**
+
+机器码本身不是秘密 —— 它在在线列表里公开可见，谁抄走都能填。真正靠得住的证据只有一种：
+**服务器亲眼见过这个机器码和这个官方账号同时在线过**。
+
+```
+玩家在游戏里登录官方账号 + 开着 BMPHWID_Bridge 进服
+        ↓  onPlayerAuth 给出 identifiers.beammp (isGuest=false)
+        ↓  客户端 mod 上报机器码
+main.lua recordBinding()  ->  bindings.json
+        { "<hwid>": {beammp_id, player_name, first_seen, last_seen, seen} }
+        ↓
+GET  /api/bng/verify?hwid=…   ->  这个机器码绑定的是哪个官方账号 / 现在在不在线
+POST /api/account/register    ->  只有"绑定过"的机器码才允许注册
+```
+
+- 游客（`isGuest=true`）**不记录**绑定 —— 否则等于给游客发一张"已验证"门票
+- 同一机器码只能注册一个账号（409）；账号里保存 `hwid` / `beammp_id` / `verified`
+
+**两种登录**
+
+| 方式 | 条件 |
+|---|---|
+| 账号 + 密码 | 普通登录 |
+| **本人在线一键登录** | 机器码已绑定账号 **且 此刻正在服务器里在线** |
+
+一键登录是网页直接读 `http://127.0.0.1:7788/hwid`（Bridge 本机接口，带 CORS）拿到机器码，
+再交给服务端核对"这个人现在真的在游戏里"。**别人抄走机器码也没用，因为他的人不在线。**
+
+**网页聊天**：`account.html` 的聊天 Tab 轮询 `/api/chat/log`，发送走 `/api/chat/send`，
+经 Lua 插件打到游戏公屏。已登录用账号名，未登录是 `guest`。
+
+**新增接口**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/account` | 注册 / 登录 / 聊天页面 |
+| GET | `/api/bng/verify?hwid=` | 查询机器码绑定的官方账号与在线状态 |
+| POST | `/api/account/register` | `{username, password, hwid}` 注册（需已绑定） |
+| POST | `/api/account/login` | `{username, password}` |
+| POST | `/api/account/login-hwid` | `{hwid}` 一键登录（需当前在线） |
+| GET | `/api/chat/log?limit=50` | 最近聊天记录 |
+
+> 需要 `panel.html` **和** `account.html` 都与 `BMP_HTTP_API.py` 同目录。
+
 ### v3.5.0 (2026-10-29) — 实时地图下线, 在线人数做对
 
 - 🗑 **移除实时地图**：`panel.html` 重写成纯粹的「在线人数 / 在线玩家」页面
