@@ -24,12 +24,12 @@
 =====================================================================
 """
 
-import re, os, sys, json, hashlib, threading, socket
+import re, os, sys, json, hashlib, threading, socket, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 HTTP_PORT = 7788
-PAYLOAD_VER = "Bridge-v2.4"
+PAYLOAD_VER = "Bridge-v2.5"
 HTTP_NAME = f"BMPHWID_Bridge/v{VERSION}"
 WIN_TITLE = f"BeamMP 认证器 v{VERSION}  —  HWID + 命令手册 + 直连服务器"
 
@@ -100,6 +100,51 @@ def _norm_url(base):
         pass
     return base, ""
 
+# ============================================================
+#  让阻塞 HTTP 不冻结界面
+#  Tk 只能在主线程碰, 所以「后台线程发请求 + 主线程泵事件」是这里最省事
+#  又安全的做法: 服务器不可达时窗口不再假死 (拖动/重绘/关闭都正常)。
+#  嵌套用深度计数挡住, 避免事件回调里再发请求导致无限递归。
+# ============================================================
+_PUMP_ROOT = None
+_PUMP_DEPTH = 0
+
+
+def _run_http(fn, timeout=8):
+    """在后台线程执行 fn()，期间泵 Tk 事件；返回结果或原样抛出异常。"""
+    global _PUMP_DEPTH
+    root = _PUMP_ROOT
+    if root is None or _PUMP_DEPTH > 0:
+        return fn()
+    box = {}
+
+    def worker():
+        try:
+            box["v"] = (True, fn())
+        except BaseException as e:          # noqa: BLE001 - 原样传回主线程
+            box["v"] = (False, e)
+
+    t = threading.Thread(target=worker, daemon=True)
+    _PUMP_DEPTH += 1
+    try:
+        t.start()
+        deadline = time.time() + (timeout or 8) + 5
+        while t.is_alive() and time.time() < deadline:
+            try:
+                root.update()
+            except Exception:
+                break
+            t.join(0.01)
+    finally:
+        _PUMP_DEPTH -= 1
+    if t.is_alive():
+        raise TimeoutError("请求超时")
+    ok, val = box.get("v", (False, TimeoutError("请求超时")))
+    if not ok:
+        raise val
+    return val
+
+
 def api_post(path, body_obj=None, timeout=8):
     """POST JSON 到服务器 HTTP API. 返回 (ok, result_dict)"""
     base, err = _norm_url(CFG.get("server_url") or "")
@@ -112,14 +157,16 @@ def api_post(path, body_obj=None, timeout=8):
     req.add_header("Content-Type", "application/json; charset=utf-8")
     if token:
         req.add_header("Authorization", "Bearer " + token)
+
+    def _do():
+        raw = urllib.request.urlopen(req, timeout=timeout).read() or b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {"ok": False, "msg": raw.decode("utf-8", errors="replace")[:200]}
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read() or b"{}"
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception:
-                obj = {"ok": False, "msg": raw.decode("utf-8", errors="replace")[:200]}
-            return True, obj
+        return True, _run_http(_do, timeout)
     except urllib.error.HTTPError as e:
         try:
             raw = e.read() or b"{}"
@@ -138,18 +185,20 @@ def api_ping(timeout=6):
     if err:
         return False, {"ok": False, "msg": err}
     url = base + "/api/ping"
+
+    def _do():
+        raw = urllib.request.urlopen(url, timeout=timeout).read() or b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            # 返回 200 但不是 JSON: 说明地址/端口填到了别的东西上,
+            # 旧实现会亮绿灯, 然后每个 api_post 都失败
+            return None
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            raw = resp.read() or b"{}"
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception:
-                # 返回 200 但不是 JSON: 说明地址/端口填到了别的东西上,
-                # 旧实现会亮绿灯, 然后每个 api_post 都失败
-                return False, {"ok": False, "msg": "返回不是 JSON 接口 (端口/地址填错了?)"}
-            if not isinstance(obj, dict):
-                return False, {"ok": False, "msg": "返回不是 JSON 接口 (端口/地址填错了?)"}
-            return True, obj
+        obj = _run_http(_do, timeout)
+        if not isinstance(obj, dict):
+            return False, {"ok": False, "msg": "返回不是 JSON 接口 (端口/地址填错了?)"}
+        return True, obj
     except Exception as e:
         return False, {"ok": False, "msg": "不通: " + str(e)}
 
@@ -646,6 +695,10 @@ def _run_gui(hwid, sources_list):
     root.geometry("880x720")
     root.minsize(760, 600)
     root.configure(bg="#f7f7f9")
+
+    # 让 api_post/api_get 能泵 Tk 事件 (见 _run_http), 服务器不可达时窗口不假死
+    global _PUMP_ROOT
+    _PUMP_ROOT = root
 
     # ====== 选项卡 (Notebook) ======
     nb = ttk.Notebook(root)
@@ -1382,14 +1435,17 @@ def _run_gui(hwid, sources_list):
     tab4 = tk.Frame(nb, bg="#f7f7f9")
     nb.add(tab4, text="  \U0001F3AE 玩家列表 + 投票  ")
     
-    # 顶部: 自己的名字 + 服务器状态
+    # 顶部: 登录身份 + 服务器状态
+    #   投票的发起人/投票人名字现在由服务端按 token 取账号名, 这里只做展示
     vk_top = tk.Frame(tab4, bg="#f7f7f9")
     vk_top.pack(fill="x", padx=10, pady=(10, 4))
-    tk.Label(vk_top, text="你的名字:", font=("Microsoft YaHei UI", 10, "bold"),
+    tk.Label(vk_top, text="当前身份:", font=("Microsoft YaHei UI", 10, "bold"),
              bg="#f7f7f9", fg="#0f172a").pack(side="left", padx=(0, 4))
-    e_vote_name = tk.Entry(vk_top, font=("Microsoft YaHei UI", 11), width=16)
-    e_vote_name.insert(0, CFG.get("last_player_name") or CFG.get("username") or "")
-    e_vote_name.pack(side="left")
+    lbl_vote_identity = tk.Label(vk_top,
+                                 text=(CFG.get("username") or "(未登录 — 投票需要先登录)"),
+                                 font=("Microsoft YaHei UI", 10),
+                                 bg="#f7f7f9", fg="#1d4ed8")
+    lbl_vote_identity.pack(side="left")
     
     lbl_vote_status = tk.Label(vk_top, text="", font=("Microsoft YaHei UI", 9),
                                bg="#f7f7f9", fg="#64748b")
@@ -1436,9 +1492,8 @@ def _run_gui(hwid, sources_list):
     e_vote_reason.pack(fill="x", padx=4, pady=(0, 4))
     
     def _do_vote_kick():
-        name = e_vote_name.get().strip()
-        if not name:
-            lbl_vote_status.configure(text="请先填写你的名字", fg="#dc2626")
+        if not CFG.get("access_token"):
+            lbl_vote_status.configure(text="请先登录再发起投票 (Tab3 直连服务器)", fg="#dc2626")
             return
         sel = list_players.curselection()
         if not sel:
@@ -1450,7 +1505,8 @@ def _run_gui(hwid, sources_list):
             lbl_vote_status.configure(text="请选择真实的在线玩家", fg="#dc2626")
             return
         reason = e_vote_reason.get().strip()
-        body = {"target_name": target, "initiator_name": name, "reason": reason}
+        # 发起人由服务端按 token 取账号名, 这里不需要也不应该自报名字
+        body = {"target_name": target, "reason": reason}
         net_ok, obj = api_post("/api/vote/kick", body)
         if net_ok and obj.get("ok"):
             lbl_vote_status.configure(text=f"已发起对 {target} 的投票", fg="#16a34a")
@@ -1490,16 +1546,16 @@ def _run_gui(hwid, sources_list):
     btn_no.pack(fill="x", padx=4, pady=(2, 4))
     
     def _do_vote_cast(vote_val):
-        name = e_vote_name.get().strip()
-        if not name:
-            lbl_vote_status.configure(text="请先填写你的名字", fg="#dc2626")
+        if not CFG.get("access_token"):
+            lbl_vote_status.configure(text="请先登录再投票 (Tab3 直连服务器)", fg="#dc2626")
             return
-        body = {"voter_name": name, "vote": vote_val}
+        # 投票人由服务端按 token 取账号名
+        body = {"vote": vote_val}
         net_ok, obj = api_post("/api/vote/cast", body)
         if net_ok and obj.get("ok"):
             lbl_vote_status.configure(text=f"已投票: {vote_val}", fg="#16a34a")
         else:
-            lbl_vote_status.configure(text=obj.get("error", "投票失败"), fg="#dc2626")
+            lbl_vote_status.configure(text=obj.get("error") or obj.get("msg") or "投票失败", fg="#dc2626")
     
     btn_yes.configure(command=lambda: _do_vote_cast("yes"))
     btn_no.configure(command=lambda: _do_vote_cast("no"))
@@ -1536,48 +1592,59 @@ def _run_gui(hwid, sources_list):
             lbl_vote_status.configure(text="服务器连接失败", fg="#dc2626")
     
     # 函数: 刷新投票状态 (每3秒轮询)
+    #   http 走 api_ping 风格的后台执行, 不再让 3s 超时把整个窗口冻住
     def _refresh_vote_status():
         base, err = _norm_url(CFG.get("server_url") or "")
-        if err:
-            root.after(3000, _refresh_vote_status)
-            return
-        import urllib.request as _ur
-        try:
-            with _ur.urlopen(base + "/api/vote/status", timeout=3) as resp:
-                raw = resp.read() or b"{}"
-                o = json.loads(raw.decode("utf-8"))
-                pending = o.get("pending_kick")
-                if pending:
-                    target = pending.get("target_name", "?")
-                    initiator = pending.get("initiator_name", "?")
-                    reason = pending.get("reason", "")
-                    lbl_vote_target.configure(text=f"投票中: {initiator} → {target}\n原因: {reason}")
-                    lbl_vote_countdown.configure(text="请投票! 赞成或反对")
-                    btn_yes.configure(state="normal")
-                    btn_no.configure(state="normal")
-                    lbl_vote_progress.configure(text="投票正在进行中, 请在游戏中查看实时进度")
-                else:
-                    lbl_vote_target.configure(text="当前无进行中的投票")
-                    lbl_vote_countdown.configure(text="")
-                    btn_yes.configure(state="disabled")
-                    btn_no.configure(state="disabled")
-                    lbl_vote_progress.configure(text="")
-        except Exception:
-            pass
+        if not err:
+            def _do():
+                import urllib.request as _ur
+                raw = _ur.urlopen(base + "/api/vote/status", timeout=3).read() or b"{}"
+                return json.loads(raw.decode("utf-8"))
+            try:
+                o = _run_http(_do, 3)
+            except Exception:
+                o = None
+            if isinstance(o, dict):
+                try:
+                    pending = o.get("pending_kick")
+                    if pending:
+                        target = pending.get("target_name", "?")
+                        initiator = pending.get("initiator_name", "?")
+                        reason = pending.get("reason", "")
+                        lbl_vote_target.configure(text=f"投票中: {initiator} → {target}\n原因: {reason}")
+                        lbl_vote_countdown.configure(text="请投票! 赞成或反对")
+                        btn_yes.configure(state="normal")
+                        btn_no.configure(state="normal")
+                        lbl_vote_progress.configure(text="投票正在进行中, 请在游戏中查看实时进度")
+                    else:
+                        lbl_vote_target.configure(text="当前无进行中的投票")
+                        lbl_vote_countdown.configure(text="")
+                        btn_yes.configure(state="disabled")
+                        btn_no.configure(state="disabled")
+                        lbl_vote_progress.configure(text="")
+                except Exception:
+                    pass
         root.after(3000, _refresh_vote_status)
     
     # 自动定时刷新
+    _refresh_all_busy = {"v": False}
+
     def _auto_refresh_all():
-        _refresh_players()
+        if _refresh_all_busy["v"]:
+            root.after(5000, _auto_refresh_all)
+            return
+        _refresh_all_busy["v"] = True
+        try:
+            _refresh_players()
+        except Exception:
+            pass
+        finally:
+            _refresh_all_busy["v"] = False
         root.after(5000, _auto_refresh_all)
     
-    # 首次加载
-    try:
-        _refresh_players()
-    except Exception:
-        pass
-    _refresh_vote_status()
-    root.after(5000, _auto_refresh_all)
+    # 首次加载 (放到事件循环里, 避免 mainloop 之前就阻塞建窗)
+    root.after(200, _refresh_vote_status)
+    root.after(300, _auto_refresh_all)
     
     # 首次启动: 自动 ping 更新状态点
     try:

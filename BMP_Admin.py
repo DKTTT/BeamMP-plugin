@@ -14,16 +14,62 @@
 =====================================================================
 """
 
-import json, os, sys, time, hashlib, tkinter as tk
+import json, os, sys, time, hashlib, threading, tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import urllib.request, urllib.error
 from datetime import datetime
 
-VERSION = "BMP-Admin/v1.1.0"
+VERSION = "BMP-Admin/v1.2.0"
 CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, 'frozen', False) else __file__)),
     "bmp_admin_config.json"
 )
+
+# ================================================================
+#  让阻塞 HTTP 不冻结界面
+#  Tk 只能在主线程碰, 所以「把请求丢到后台线程 + 主线程泵事件」是这里
+#  唯一不需要把 15 个处理函数全部改成回调式的做法:
+#    - 窗口保持响应 (拖动/重绘/关闭)
+#    - 超时不再等于「整个程序假死」
+#  嵌套用一个深度计数挡住, 避免事件回调里再发请求导致无限递归。
+# ================================================================
+_PUMP_ROOT = None
+_PUMP_DEPTH = 0
+
+
+def _run_http(fn, timeout=8):
+    """在后台线程执行 fn()，期间泵 Tk 事件；返回 fn() 的结果或原样抛出异常。"""
+    global _PUMP_DEPTH
+    root = _PUMP_ROOT
+    if root is None or _PUMP_DEPTH > 0:
+        return fn()
+    box = {}
+
+    def worker():
+        try:
+            box["v"] = (True, fn())
+        except BaseException as e:          # noqa: BLE001 - 原样传回主线程
+            box["v"] = (False, e)
+
+    t = threading.Thread(target=worker, daemon=True)
+    _PUMP_DEPTH += 1
+    try:
+        t.start()
+        deadline = time.time() + (timeout or 8) + 5
+        while t.is_alive() and time.time() < deadline:
+            try:
+                root.update()
+            except Exception:
+                break
+            t.join(0.01)
+    finally:
+        _PUMP_DEPTH -= 1
+    if t.is_alive():
+        raise TimeoutError("请求超时")
+    ok, val = box.get("v", (False, TimeoutError("请求超时")))
+    if not ok:
+        raise val
+    return val
 
 # ---- 配置 ----
 CFG = {
@@ -76,8 +122,10 @@ def api_post(path, body=None, timeout=8):
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return True, _fill_msg(json.loads(resp.read()))
+        # 后台线程发请求 + 主线程泵事件 -> 服务器不可达时窗口也不会假死
+        parsed = _run_http(lambda: json.loads(urllib.request.urlopen(req, timeout=timeout).read()),
+                           timeout)
+        return True, _fill_msg(parsed)
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
@@ -105,8 +153,9 @@ def api_get(path, timeout=6):
         return False, {"ok": False, "msg": err}
     url = base + path
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return True, json.loads(resp.read())
+        parsed = _run_http(lambda: json.loads(urllib.request.urlopen(url, timeout=timeout).read()),
+                           timeout)
+        return True, _fill_msg(parsed)
     except Exception as e:
         return False, {"ok": False, "msg": str(e)}
 
@@ -130,10 +179,15 @@ class AdminApp:
 
         _load_cfg()
 
+        # 让 api_post/api_get 能泵 Tk 事件 (见 _run_http)
+        global _PUMP_ROOT
+        _PUMP_ROOT = root
+
         # iid -> 完整在线玩家记录 (表格里的 BeamID 是截断显示值, 不能反查)
         self._online_rows = {}
         self._accounts = {}
         self._online_job = None
+        self._refreshing_online = False
 
         self._build_ui()
         self._refresh_status()
@@ -419,6 +473,16 @@ class AdminApp:
 
     def _refresh_online(self, silent=False):
         if not self._require_admin(silent=silent): return
+        # HTTP 现在会在泵事件时让其它回调插进来, 用标记挡住重入
+        if self._refreshing_online:
+            return
+        self._refreshing_online = True
+        try:
+            self._refresh_online_impl(silent)
+        finally:
+            self._refreshing_online = False
+
+    def _refresh_online_impl(self, silent=False):
         ok, r = api_post("/api/admin/players")
         if not ok or not r.get("ok"):
             if not silent:

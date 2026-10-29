@@ -1,5 +1,5 @@
 -- ============================================================
---  BMPHWID v2.6.0  modScript 入口 (服务器请求架构版)
+--  BMPHWID v2.7.0  modScript 入口 (服务器请求架构版)
 --
 --  核心: 服务器 onPlayerConnected → MP.TriggerClientEvent("BMPHWID:RequestHWID")
 --        客户端 AddEventHandler 监听 → 收到后 probeMod.onHwidRequest()
@@ -8,7 +8,7 @@
 --  兜底: 如果 AddEventHandler 注册失败, modScript 加载时也主动发一次
 -- ============================================================
 
-print("[BMPHWID.modScript] modScript v2.6.0 入口启动 (服务器请求架构版)")
+print("[BMPHWID.modScript] modScript v2.7.0 入口启动 (服务器请求架构版)")
 
 -- 加载 extension
 local probeMod = nil
@@ -79,4 +79,4 @@ if not handlerRegistered and probeMod and type(probeMod.runOnce) == "function" t
     pcall(probeMod.runOnce)
 end
 
-print("[BMPHWID.modScript] modScript v2.6.0 入口结束 (监听已注册="..tostring(handlerRegistered)..")")
+print("[BMPHWID.modScript] modScript v2.7.0 入口结束 (监听已注册="..tostring(handlerRegistered)..")")

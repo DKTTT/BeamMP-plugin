@@ -8,7 +8,7 @@
 -- ============================================================
 
 local MOD = "bmpHwidProbe"
-local VER = "2.6.0"
+local VER = "2.7.0"
 local SERVER_EVENT = "BMPHWID:HWIDReply"
 local REQUEST_EVENT = "BMPHWID:RequestHWID"
 local BRIDGE_URL = "http://127.0.0.1:7788"
@@ -24,14 +24,29 @@ p("  服务器事件: "..SERVER_EVENT)
 
 -- ============================================================
 -- 1. UUID 生成
+--    旧实现每个字节都用 os.clock()*1e6+os.time() 取模, 而 os.clock() 是
+--    CPU 时间, 同一个循环里几乎不变 -> 16 个字节高度重复, 生成的 "随机"
+--    UUID 熵极低。
+--    改用 math.random + 显式播种 (os.time/os.clock 混合)。
+--    注意: BeamNG 跑的是 LuaJIT (Lua 5.1 语义), 不能用 5.3 的位运算符
+--    (~ << >>), 否则整段代码直接语法错误。
 -- ============================================================
+local _seeded = false
+local function _seedRng()
+    if _seeded then return end
+    _seeded = true
+    local s = (os.time() % 2147483647) + math.floor((os.clock() % 1000) * 1000)
+    if s <= 0 then s = 1 end
+    pcall(function() math.randomseed(s) end)
+end
+
 local function uuid4()
-    local function rnd(a, b) return math.floor((os.clock() * 1000000 + os.time()) % (b - a + 1)) + a end
+    _seedRng()
     local function hx(n) return string.format("%02x", n) end
     local t = {}
-    for i = 1, 16 do t[i] = rnd(0, 255) end
-    t[7] = (t[7] % 0x10) + 0x40
-    t[9] = (t[9] % 0x40) + 0x80
+    for i = 1, 16 do t[i] = math.random(0, 255) end
+    t[7] = (t[7] % 0x10) + 0x40   -- version 4
+    t[9] = (t[9] % 0x40) + 0x80   -- variant 10xx
     return hx(t[1])..hx(t[2])..hx(t[3])..hx(t[4]).."-"..
            hx(t[5])..hx(t[6]).."-"..hx(t[7])..hx(t[8]).."-"..
            hx(t[9])..hx(t[10]).."-"..hx(t[11])..hx(t[12])..hx(t[13])..hx(t[14])..hx(t[15])..hx(t[16])
@@ -66,46 +81,63 @@ end
 -- ============================================================
 local httpApi = nil
 local function probeHttp()
-    if httpApi then return httpApi end
+    -- 只在探测成功时缓存: 插件初始化可能早于 BeamMP / curl 就绪,
+    -- 旧实现会把 "全部不可用" 永久缓存住, 之后再也不重试
+    if httpApi and httpApi.ready then return httpApi end
     local res = {}
 
     -- 优先级 1: curl (BeamNG 沙箱标配, _G.curl)
+    --   注意: curl 的回调是**之后**由游戏主循环派发的, 不能在这里同步等。
+    --   旧实现用 `while not done do end` 忙等 3 秒 —— 回调永远没机会执行,
+    --   结果是每次都白等 3 秒 (游戏卡 3 秒) 且 100% 拿不到 HWID。
     local c = rawget(_G, "curl")
     p("  [HTTP] 检查 _G.curl: "..tostring(type(c)))
     if type(c) == "table" and type(c.get) == "function" then
-        res.get = function(url)
-            local result = {body=nil, done=false}
-            local ok, err = pcall(c.get, url, function(r)
-                if r and r.body then result.body = r.body end
-                result.done = true
-            end)
-            local t0 = os.clock()
-            while not result.done and (os.clock() - t0) < 3.0 do
-                -- busy wait (sandbox has no sleep)
+        res.asyncGet = function(url, cb)
+            local fired = false
+            local function once(body)
+                if fired then return end
+                fired = true
+                pcall(cb, body)
             end
-            return result.body
+            local ok, err = pcall(c.get, url, function(r)
+                local body = nil
+                if type(r) == "table" then body = r.body end
+                once(body)
+            end)
+            if not ok then
+                p("  [curl] 调用失败: "..tostring(err))
+                once(nil)
+            end
         end
         res.getName = "curl"
-        p("  [HTTP] ✅ curl.get 可用 (沙箱内置)")
+        p("  [HTTP] ✅ curl.get 可用 (沙箱内置, 异步回调)")
     end
 
-    -- 优先级 2: Engine.HTTP.request (BeamNG 标准 API)
-    if not res.get then
+    -- 优先级 2: Engine.HTTP.request (BeamNG 标准 API, 同样是异步回调)
+    if not res.asyncGet then
         local E = rawget(_G, "Engine")
         p("  [HTTP] 检查 _G.Engine: "..tostring(type(E)))
         if type(E) == "table" and type(E.HTTP) == "table" and type(E.HTTP.request) == "function" then
-            res.get = function(url)
-                local result = {body=nil, done=false}
-                E.HTTP.request("GET", url, {}, "", function(r)
-                    if r and (r.body or r.data) then result.body = r.body or r.data end
-                    result.done = true
+            res.asyncGet = function(url, cb)
+                local fired = false
+                local function once(body)
+                    if fired then return end
+                    fired = true
+                    pcall(cb, body)
+                end
+                local ok, err = pcall(E.HTTP.request, "GET", url, {}, "", function(r)
+                    local body = nil
+                    if type(r) == "table" then body = r.body or r.data end
+                    once(body)
                 end)
-                local t0 = os.clock()
-                while not result.done and (os.clock() - t0) < 3.0 do end
-                return result.body
+                if not ok then
+                    p("  [Engine.HTTP] 调用失败: "..tostring(err))
+                    once(nil)
+                end
             end
             res.getName = "Engine.HTTP.request"
-            p("  [HTTP] ✅ Engine.HTTP.request 可用")
+            p("  [HTTP] ✅ Engine.HTTP.request 可用 (异步回调)")
         end
     end
 
@@ -130,10 +162,13 @@ local function probeHttp()
         end
     end
 
-    res.ready = (res.get ~= nil) or (res.rawTcp ~= nil)
+    res.ready = (res.asyncGet ~= nil) or (res.get ~= nil) or (res.rawTcp ~= nil)
     httpApi = res
     if res.ready then
-        p("  [HTTP] ✅ HTTP 就绪: get="..tostring(res.getName or "nil").." rawTcp="..tostring(type(res.rawTcp)))
+        p("  [HTTP] ✅ HTTP 就绪: "..tostring(res.getName or "nil")
+            .." async="..tostring(type(res.asyncGet))
+            .." sync="..tostring(type(res.get))
+            .." rawTcp="..tostring(type(res.rawTcp)))
     else
         p("  [HTTP] ❌ 所有 HTTP API 都不可用!")
     end
@@ -181,6 +216,16 @@ local function rawTcpGet(url)
 end
 
 -- 从 Bridge 拉 HWID
+--   curl / Engine.HTTP 是异步回调, 这里只负责"发出去";
+--   拿到结果后由 onBridgeHwid 回调继续 (见主流程)。
+local bridgePending = { inflight = false, hwid = nil }
+local onBridgeHwid = nil
+
+local function parseHwidBody(body)
+    if type(body) ~= "string" or #body == 0 then return nil end
+    return body:match('"hwid"%s*:%s*"([^"]+)"')
+end
+
 local function fetchHwidFromBridge()
     local api = probeHttp()
     if not api.ready then
@@ -188,12 +233,33 @@ local function fetchHwidFromBridge()
         return nil
     end
 
-    -- 路径 1: 封装好的 get (curl / Engine.HTTP / socket.http)
+    -- 路径 1: 异步 API (curl / Engine.HTTP.request)
+    if api.asyncGet then
+        if not bridgePending.inflight then
+            bridgePending.inflight = true
+            p("  [fetch] 异步 GET "..BRIDGE_URL.."/hwid ("..tostring(api.getName)..")")
+            api.asyncGet(BRIDGE_URL .. "/hwid", function(body)
+                bridgePending.inflight = false
+                local hwid_m = parseHwidBody(body)
+                if hwid_m then
+                    bridgePending.hwid = hwid_m
+                    p("  [fetch] ✅ 异步收到 Bridge HWID: "..hwid_m)
+                    if onBridgeHwid then pcall(onBridgeHwid, hwid_m) end
+                else
+                    p("  [fetch] 异步返回里没有有效 HWID (Bridge 没启动?)")
+                end
+            end)
+        end
+        -- 已经拿到过就直接用
+        return bridgePending.hwid
+    end
+
+    -- 路径 2: 阻塞式 socket.http
     if api.get then
-        p("  [fetch] 路径1: GET "..BRIDGE_URL.."/hwid 用 "..tostring(api.getName))
+        p("  [fetch] 路径2: GET "..BRIDGE_URL.."/hwid 用 "..tostring(api.getName))
         local body, code = api.get(BRIDGE_URL .. "/hwid")
         if body and type(body) == "string" and #body > 0 then
-            local hwid_m = body:match('"hwid"%s*:%s*"([^"]+)"')
+            local hwid_m = parseHwidBody(body)
             if hwid_m then
                 p("  [fetch] ✅ 从 Bridge 拉到 HWID: "..hwid_m)
                 return hwid_m
@@ -204,12 +270,12 @@ local function fetchHwidFromBridge()
         p("  [fetch] GET 返回空 body (code="..tostring(code)..")")
     end
 
-    -- 路径 2: raw TCP
+    -- 路径 3: raw TCP
     if api.rawTcp then
-        p("  [fetch] 路径2: socket.tcp 原始 TCP")
+        p("  [fetch] 路径3: socket.tcp 原始 TCP")
         local body, err = rawTcpGet(BRIDGE_URL .. "/hwid")
         if body then
-            local hwid_m = body:match('"hwid"%s*:%s*"([^"]+)"')
+            local hwid_m = parseHwidBody(body)
             if hwid_m then
                 p("  [fetch] ✅ [raw TCP] 拉到 HWID: "..hwid_m)
                 return hwid_m
@@ -285,11 +351,69 @@ local state = {
     httpSeenFail = 0,
 }
 
+-- ------------------------------------------------------------
+-- 组装发往服务器的事件帧
+--   服务器 main.lua 的 handleHwidReplyFromClient 期望:
+--     "F@<me>|<payload>", payload = "v1|cnt=N|key1=<b64>|key2=<b64>|..."
+--   旧实现发的是 "F@hwid|v1|cnt=1|cur=0|<整段 b64>",
+--   而服务器 parseHwidPayload 把第 2 段之后都当成 key=b64,
+--   于是 "cur=0" 被当字段、整段 b64 因为不含 '=' 被直接丢弃
+--   —— 服务器其实一个字段都没收到, HWID 永远是空的。
+-- ------------------------------------------------------------
+local FRAME_FIELDS = {
+    {"_version",                 "BMPHWID-v2.7"},
+    {"bridge_os_version",        "win32"},
+    {"bridge_sources",           "bridge.exe+lua-socket"},
+    {"core_env_fingerprint",     "fnv1a"},
+    {"settings.BMPLoginHWID(uuid)", nil},   -- 填 hwid
+    {"uuid",                     nil},
+}
+
+local function buildFrame(hwid)
+    local parts = {}
+    local n = 0
+    for _, kv in ipairs(FRAME_FIELDS) do
+        local key, val = kv[1], kv[2] or hwid
+        if val and val ~= "" then
+            parts[#parts + 1] = key .. "=" .. b64encode(tostring(val))
+            n = n + 1
+        end
+    end
+    return "F@" .. tostring(hwid) .. "|v1|cnt=" .. n .. "|" .. table.concat(parts, "|")
+end
+
+local function sendReply(hwid)
+    if not hwid or hwid == "" then return false end
+    local api = probeBeamMP()
+    if type(api.triggerType) ~= "function" or not api.triggerFn then
+        return false
+    end
+    local frame = buildFrame(hwid)
+    p("  🚀 TriggerServerEvent('"..SERVER_EVENT.."', "..#frame.." bytes)")
+    local ok, err = pcall(api.triggerFn, SERVER_EVENT, frame)
+    if ok then
+        state.cachedHwid = hwid
+        state.sendSucceeded = true
+        saveHwidToSettings(hwid)
+        p("  ✅✅✅ 已发送 HWID: "..hwid)
+        return true
+    end
+    p("  ❌ 发送失败: "..tostring(err))
+    return false
+end
+
+-- Bridge 异步回调到达时: 用真实机器码补发一次
+onBridgeHwid = function(hwid)
+    if not hwid then return end
+    p("  📥 Bridge 回调送达, 用真实 HWID 重发")
+    sendReply(hwid)
+end
+
 local function runOnce()
     state.attempts = state.attempts + 1
     p("▶ 尝试 #"..state.attempts.." (t="..string.format("%.1f", state.tElapsed).."s)")
 
-    -- 1) HWID: settings → Bridge HTTP → 兜底生成
+    -- 1) HWID: settings → Bridge (同步分支会直接返回; 异步分支在回调里补发)
     if not state.cachedHwid then
         local v = loadHwidFromSettings()
         if v then
@@ -320,34 +444,15 @@ local function runOnce()
         state.triggerSeenNil = state.triggerSeenNil + 1
     end
 
-    -- 3) 发送
+    -- 3) 发送 (异步 HTTP 的情况下, 稍后 Bridge 回调还会用真实 HWID 再发一次)
     if tse_type == "function" and api.triggerFn then
-        local lines = {
-            "_version\tBMPHWID-v2.3",
-            "bridge_os_version\twin32",
-            "bridge_sources\tbridge.exe+lua-socket",
-            "core_env_fingerprint\tfnv1a",
-            "settings.BMPLoginHWID(uuid)\t"..state.cachedHwid,
-            "uuid\t"..state.cachedHwid,
-        }
-        local payload = b64encode(table.concat(lines, "\n"))
-        local frame = "F@"..state.cachedHwid.."|v1|cnt=1|cur=0|"..payload
-        p("  🚀 TriggerServerEvent('"..SERVER_EVENT.."', "..#frame.." bytes)")
-        local ok, err = pcall(api.triggerFn, SERVER_EVENT, frame)
-        if ok then
-            state.sendSucceeded = true
-            p("  ✅✅✅ 成功! HWID: "..state.cachedHwid)
-            p("  服务器应该收到 BMPHWID:HWIDReply, 绑定该 HWID 到你的账号")
-            return true
-        else
-            p("  ❌ 发送失败: "..tostring(err))
-        end
+        return sendReply(state.cachedHwid)
+    end
+
+    if state.tElapsed < 60.0 then
+        p("  ⏳ "..string.format("%.0f", 60.0 - state.tElapsed).."s 内继续等 BeamMP 加载 (TriggerServerEvent="..tostring(tse_type)..")")
     else
-        if state.tElapsed < 60.0 then
-            p("  ⏳ "..string.format("%.0f", 60.0 - state.tElapsed).."s 内继续等 BeamMP 加载 (TriggerServerEvent="..tostring(tse_type)..")")
-        else
-            p("  ⚠️ 60s 已过, TriggerServerEvent 仍是 "..tostring(tse_type))
-        end
+        p("  ⚠️ 60s 已过, TriggerServerEvent 仍是 "..tostring(tse_type))
     end
     return false
 end
@@ -385,31 +490,16 @@ function M.onHwidRequest()
     local ok, result = pcall(runOnce)
     if ok and result then
         p("✅ HWID 请求响应成功")
-    else
-        p("❌ HWID 请求响应失败: "..tostring(result))
-        -- 即使失败也生成一个 HWID 发送 (不阻塞玩家)
-        if not state.cachedHwid then
-            state.cachedHwid = uuid4()
-            saveHwidToSettings(state.cachedHwid)
-            p("  ⚠️ Bridge 不可用, 生成临时 UUID: "..state.cachedHwid)
-        end
-        -- 用缓存/临时 UUID 发送一次 (让玩家至少能进服务器)
-        local api = probeBeamMP()
-        if api.triggerFn then
-            local lines = {
-                "_version\tBMPHWID-v2.6",
-                "bridge_os_version\twin32",
-                "bridge_sources\tbridge.exe+lua-socket",
-                "core_env_fingerprint\tfnv1a",
-                "settings.BMPLoginHWID(uuid)\t"..state.cachedHwid,
-                "uuid\t"..state.cachedHwid,
-            }
-            local payload = b64encode(table.concat(lines, "\n"))
-            local frame = "F@"..state.cachedHwid.."|v1|cnt=1|cur=0|"..payload
-            p("  🚀 兜底发送 (无 Bridge): "..#frame.." bytes")
-            pcall(api.triggerFn, SERVER_EVENT, frame)
-        end
+        return
     end
+    p("❌ HWID 请求响应失败: "..tostring(result))
+    -- 即使失败也发一次缓存/临时 HWID, 不阻塞玩家
+    if not state.cachedHwid then
+        state.cachedHwid = loadHwidFromSettings() or uuid4()
+        saveHwidToSettings(state.cachedHwid)
+        p("  ⚠️ Bridge 不可用, 使用缓存/临时 UUID: "..state.cachedHwid)
+    end
+    sendReply(state.cachedHwid)
 end
 
 p("✅ bmpHwidProbe v"..VER.." 注册完成")

@@ -68,7 +68,7 @@ _set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.1.0"
+VERSION = "BMP-HTTP/v1.2.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -84,6 +84,25 @@ LOGIN_LOCKOUT_SECONDS = 600  # 超限后锁定 10 分钟
 
 # ---- 请求体限制 ----
 MAX_BODY_SIZE = 65536    # 64 KB (JSON body)
+
+# ---- 投票请求限速 (按客户端 IP) ----
+VOTE_RATE = {}
+VOTE_RATE_WINDOW = 60
+VOTE_RATE_MAX = 6
+
+
+def _vote_allowed(ip):
+    now = int(time.time())
+    hits = [t for t in VOTE_RATE.get(ip, []) if now - t < VOTE_RATE_WINDOW]
+    if len(hits) >= VOTE_RATE_MAX:
+        VOTE_RATE[ip] = hits
+        return False
+    hits.append(now)
+    VOTE_RATE[ip] = hits
+    if len(VOTE_RATE) > 5000:
+        for k in list(VOTE_RATE.keys())[:2500]:
+            VOTE_RATE.pop(k, None)
+    return True
 
 # ---- 管理员审计日志 ----
 # ADMIN_AUDIT_FILE 由 _set_data_dir() 统一赋值
@@ -160,20 +179,27 @@ def _deduplicate_bids(bids):
             result.extend(items)
     return result
 
-def readJsonFile(path):
+def readJsonFile(path, retries=4, delay=0.04):
     """读 JSON. 文件不存在 -> None; 文件损坏 -> 抛 DataFileError.
 
     旧实现把所有异常都吞成 None, 于是"文件损坏"和"文件不存在"无法区分,
-    随后的注册/封禁会把整份 accounts.json / banlist.json 覆盖成只剩一条记录。"""
+    随后的注册/封禁会把整份 accounts.json / banlist.json 覆盖成只剩一条记录。
+
+    这里额外做几次重试: Lua 插件与 Python API 是两个进程, Lua 在 Windows 上
+    改名失败时会退回"截断后重写", 正好读到半个文件是可能的。重试能消掉这种
+    瞬时误判, 真正损坏的文件仍然会抛异常 (调用方拒绝写入)。"""
     if not os.path.exists(path):
         return None
     last = None
-    for enc in ("utf-8-sig", "utf-8"):
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return json.loads(f.read() or "null")
-        except (OSError, ValueError) as e:
-            last = e
+    for attempt in range(max(1, retries)):
+        for enc in ("utf-8-sig", "utf-8"):
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    return json.loads(f.read() or "null")
+            except (OSError, ValueError) as e:
+                last = e
+        if attempt + 1 < retries:
+            time.sleep(delay)
     raise DataFileError(f"{os.path.basename(path)}: {last}")
 
 def writeJsonFile(path, obj):
@@ -415,6 +441,10 @@ class APIHandler(BaseHTTPRequestHandler):
             return False
         return any(ip_obj in n for n in subnets)
 
+    def _vote_allowed(self):
+        """投票接口按客户端 IP 限速 (防刷队列)"""
+        return _vote_allowed(self.client_address[0])
+
     def _json(self, status, body):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -528,10 +558,10 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._chat_queue(auth)
         # ---- /api/vote/kick (Bridge 发起投票) ----
         if path == "/api/vote/kick":
-            return self._vote_kick(body)
+            return self._vote_kick(auth, body)
         # ---- /api/vote/cast (Bridge 投票) ----
         if path == "/api/vote/cast":
-            return self._vote_cast(body)
+            return self._vote_cast(auth, body)
 
         # ---- 管理员 API ----
         if path.startswith("/api/admin/"):
@@ -821,15 +851,18 @@ class APIHandler(BaseHTTPRequestHandler):
         Lua 主插件 onTick 会每秒 poll 这个文件, 读到未发送消息就
         MP.SendChatMessage(-1, "[Bridge] name: text") 广播给所有在线玩家.
         """
-        # 1) 取身份 (可选登录态: 已登录用 username, 否则用 player_name)
+        # 1) 取身份: 已登录一律用账号名 (不允许自报名字冒充别人);
+        #    未登录只能是 "guest", 不能借用任意 player_name 在公屏上冒充某玩家。
         username = _validate_token(auth)
-        name = (body.get("player_name") or body.get("name") or "").strip()
-        if not name:
-            name = username or "guest"
-        # 截断名字长度
+        claimed = (body.get("player_name") or body.get("name") or "").strip()
+        if username:
+            name = username
+            if claimed and claimed != username:
+                _audit_log("chat_name_ignored", username, detail=f"claimed={claimed}")
+        else:
+            name = "guest"
         if len(name) > 16:
             name = name[:16]
-        # 简单过滤: 不允许纯空格 / 控制字符
         name = re.sub(r"[\x00-\x1f<>{}\[\]|\\^]+", "_", name).strip() or "guest"
 
         # 2) 文本检查
@@ -875,8 +908,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 # 队列上限 100 (旧的丢掉)
                 if len(queue) > 100:
                     queue = queue[-100:]
-                if not writeJsonFile(CHAT_QUEUE_FILE, queue):
-                    return self._json(500, {"ok": False, "msg": "队列写入失败"})
+                ok_w, err_w = writeJsonFile(CHAT_QUEUE_FILE, queue)
+                if not ok_w:
+                    return self._json(500, {"ok": False, "msg": f"队列写入失败: {err_w}"})
         except Exception as e:
             return self._json(500, {"ok": False, "msg": "队列写入异常: " + str(e)})
 
@@ -1204,59 +1238,74 @@ class APIHandler(BaseHTTPRequestHandler):
         names = [p.get("name", "") for p in data if isinstance(p, dict) and p.get("name")]
         return self._json(200, {"ok": True, "data": names})
 
-    def _vote_kick(self, body):
-        """Bridge 发起投票踢出 → 写入 vote_queue.json, Lua 轮询处理"""
-        target_name = (body.get("target_name") or "").strip()
-        initiator_name = (body.get("initiator_name") or "").strip()
-        reason = (body.get("reason") or "").strip()
+    def _vote_kick(self, auth, body):
+        """Bridge 发起投票踢出 → 写入 vote_queue.json, Lua 轮询处理.
+        必须登录: Lua 端是按玩家名匹配 onlinePlayers 的, 匿名调用等于可以
+        随便冒充任意在线玩家发起投票。"""
+        username = _validate_token(auth)
+        if not username:
+            return self._json(401, {"ok": False, "error": "请先登录再发起投票"})
+        if not self._vote_allowed():
+            return self._json(429, {"ok": False, "error": "投票请求过于频繁, 请稍后再试"})
+        target_name = _get_str(body, "target_name")
+        reason = _get_str(body, "reason")[:200]
         if not target_name:
             return self._json(400, {"ok": False, "error": "需要 target_name (目标玩家名)"})
-        if not initiator_name:
-            return self._json(400, {"ok": False, "error": "需要 initiator_name (发起人名字)"})
 
         now = int(time.time())
         entry = {
             "action": "kick",
             "target_name": target_name,
-            "initiator_name": initiator_name,
+            "initiator_name": username,      # 永远用登录账号, 不采信 body
             "reason": reason,
             "timestamp": now,
             "processed": False,
         }
         with FILE_LOCK:
-            queue = readJsonFile(VOTE_QUEUE_FILE) or []
+            queue = readJsonFile(VOTE_QUEUE_FILE)
             if not isinstance(queue, list):
                 queue = []
+            # 队列上限: 防止有人刷爆文件
+            pending = [e for e in queue if isinstance(e, dict) and not e.get("processed")]
+            if len(pending) >= 20:
+                return self._json(429, {"ok": False, "error": "投票队列已满, 请稍后再试"})
             queue.append(entry)
-            writeJsonFile(VOTE_QUEUE_FILE, queue)
+            ok, err = writeJsonFile(VOTE_QUEUE_FILE, queue)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"写入失败: {err}"})
 
+        _audit_log("vote_kick", username, target=target_name, detail=reason)
         return self._json(200, {"ok": True, "msg": f"已发起对 {target_name} 的投票"})
 
-    def _vote_cast(self, body):
-        """Bridge 参与投票 → 写入 vote_queue.json, Lua 轮询处理"""
-        voter_name = (body.get("voter_name") or "").strip()
-        vote = (body.get("vote") or "").strip().lower()
-        if not voter_name:
-            return self._json(400, {"ok": False, "error": "需要 voter_name (投票人名字)"})
+    def _vote_cast(self, auth, body):
+        """Bridge 参与投票 → 写入 vote_queue.json, Lua 轮询处理 (同样必须登录)"""
+        username = _validate_token(auth)
+        if not username:
+            return self._json(401, {"ok": False, "error": "请先登录再投票"})
+        if not self._vote_allowed():
+            return self._json(429, {"ok": False, "error": "投票请求过于频繁, 请稍后再试"})
+        vote = _get_str(body, "vote").lower()
         if vote not in ("yes", "y", "赞成", "no", "n", "反对"):
             return self._json(400, {"ok": False, "error": "vote 必须是 yes/no"})
 
         now = int(time.time())
         entry = {
             "action": "vote",
-            "voter_name": voter_name,
+            "voter_name": username,          # 永远用登录账号
             "vote": vote,
             "timestamp": now,
             "processed": False,
         }
         with FILE_LOCK:
-            queue = readJsonFile(VOTE_QUEUE_FILE) or []
+            queue = readJsonFile(VOTE_QUEUE_FILE)
             if not isinstance(queue, list):
                 queue = []
             queue.append(entry)
-            writeJsonFile(VOTE_QUEUE_FILE, queue)
+            ok, err = writeJsonFile(VOTE_QUEUE_FILE, queue)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"写入失败: {err}"})
 
-        return self._json(200, {"ok": True, "msg": f"已记录 {voter_name} 的投票"})
+        return self._json(200, {"ok": True, "msg": f"已记录 {username} 的投票"})
 
     def _vote_status(self):
         """Bridge 查询当前投票状态"""

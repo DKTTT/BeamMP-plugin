@@ -76,7 +76,9 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 | `/api/auth/whoami` | 查看当前身份/绑定/车辆上限 | ✅ |
 | `/api/hwid/bind` | 绑定 HWID 到账号 | 可选 |
 | `/api/vehicle/limit` | 查询车辆上限 | ✅ |
-| `/api/chat/send` | 公屏聊天广播 | 可选 |
+| `/api/chat/send` | 公屏聊天广播 (未登录显示为 `guest`, 不能自报名字) | 可选 |
+| `/api/vote/kick` | 发起投票踢出 (发起人取登录账号) | ✅ |
+| `/api/vote/cast` | 参与投票 (投票人取登录账号) | ✅ |
 | `GET /api/ping` | 健康检查 | ❌ |
 
 ### 管理员 API（需管理员 token）
@@ -131,7 +133,9 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 | IP 白名单 | `--allow-ips 114.0.0.0/8,192.168.0.0/16` (POST 与 GET 全部生效) |
 | 聊天速率 | 6 条/分钟 |
 | 管理员账号名 | `--admins` 里的账号名是保留名, 不能被匿名注册抢注 |
-| 数据文件保护 | `accounts.json` / `banlist.json` 解析失败时拒绝写入 (503), 不会用空库覆盖真实数据 |
+| 发言身份 | `/api/chat/send` 不接受自报名字: 已登录用账号名, 未登录只能是 `guest` |
+| 投票身份 | `/api/vote/*` 必须登录, 发起人/投票人一律取账号名; 按 IP 限速 6 次/分钟 |
+| 数据文件保护 | `accounts.json` / `banlist.json` 解析失败时拒绝写入 (503), 不会用空库覆盖真实数据; 读到半个文件会自动重试, 不会误判 |
 | Token 吊销 | 改密码 / 删账号 / 撤销管理员时立刻作废该账号所有 token |
 
 ---
@@ -189,6 +193,46 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 ---
 
 ## 📋 变更日志
+
+### v3.2.0 (2026-10-29) — 第二轮: 客户端 mod + 界面卡死 + 冒名漏洞
+
+这一轮处理的是 v3.1.0 里明确标注"没做"的遗留项。
+
+**客户端 mod (`BMPHWID.zip` → v2.7.0) — 之前从没审过**
+- 🐞 **HWID 从来没能上报成功**: 客户端发的是 `F@hwid|v1|cnt=1|cur=0|<整段 b64>`,
+  而服务器 `parseHwidPayload` 把第 2 段之后都当 `key=b64` —— `cur=0` 被当成一个字段,
+  整段 b64 因为不含 `=` 被直接丢弃。等于玩家机器码永远为空, 自动认证全靠 GUEST/IP 兜底。
+  已改为服务器期望的 `F@<me>|v1|cnt=N|key1=<b64>|...`, 并且服务端**向后兼容**旧 zip。
+- 🐞 **主线程卡 3 秒**: `curl` / `Engine.HTTP.request` 的回调由游戏主循环派发,
+  旧代码却用 `while not done do end` 忙等 3 秒 —— 回调永远没机会执行,
+  结果是每次都白卡 3 秒且 100% 拿不到 HWID。改为异步回调, 结果到了再补发一次。
+- 🐞 UUID 兜底熵极低: 16 个字节全部来自 `os.clock()*1e6+os.time()` 取模,
+  而 `os.clock()` 在同一循环里几乎不变 → 生成的 "随机" ID 高度重复。
+  改用 `math.random` + 显式播种 (注意: BeamNG 是 LuaJIT/5.1 语义, **不能用 5.3 的位运算符**)。
+- 🐞 HTTP 探测结果被永久缓存: 插件加载早于 curl/BeamMP 就绪时, "全部不可用" 会被记一辈子,
+  之后再也不重试 → 改为只在探测成功时缓存。
+
+**界面假死 (BMP_Admin / BMPHWID_Bridge)**
+- 🐞 两个 GUI 的所有 HTTP 请求原来都跑在 Tk 主线程上, 服务器不可达时窗口彻底卡死
+  (Admin 每 5 秒一次、Bridge 每 3 秒一次)。现在请求放到后台线程,
+  主线程用 `root.update()` 泵事件 —— 窗口可以拖动/重绘/关闭, 超时也不再等于假死。
+  加了嵌套深度计数防止事件回调里再发请求导致递归。
+- 🐞 Bridge 启动时在 `mainloop()` 之前就同步拉两次数据, 启动白屏数秒 → 改成 `after()` 排队。
+
+**冒名 / 滥用 (BMP_HTTP_API.py)**
+- 🔒 `/api/chat/send` 原来完全采信 body 里的 `player_name`, 任何人都能在公屏上
+  以任意玩家名义发言 → 已登录一律用账号名, 未登录只能是 `guest`。
+- 🔒 `/api/vote/kick` `/api/vote/cast` 无需登录且发起人/投票人名字来自 body,
+  Lua 端又是按名字匹配在线玩家 → 匿名就能冒充任意玩家发起投票踢人。
+  现在必须登录, 名字一律取账号; 并按 IP 限速 6 次/分钟、待处理队列上限 20 条。
+- 🐞 `/api/chat/send` 的 `if not writeJsonFile(...)` 判断永远为假 (函数返回的是元组),
+  写盘失败仍返回成功。
+
+**并发写文件**
+- 🐞 Lua 插件与 Python API 是两个进程, Windows 上 Lua 的 `os.rename` 覆盖失败会退回
+  "截断后重写", 正好被 Python 读到半个 JSON。`readJsonFile` 现在会重试 4 次 (40ms 间隔),
+  真正损坏的文件仍然抛 `DataFileError` 让调用方拒绝写入 —— 既不会被瞬时竞态误伤,
+  也不会用空库覆盖真实数据。
 
 ### v3.1.0 (2026-10-29) — 兼容 BeamMP-Server v3.9.4 + 大批 bug 修复
 

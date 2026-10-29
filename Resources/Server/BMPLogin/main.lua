@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.1.0 (完整管理员版)
+-- BMP Login Plugin v3.1.1 (完整管理员版)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.1.0"
+local PLUGIN_VERSION = "3.1.1"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -2465,6 +2465,31 @@ end
 
 local function parseHwidPayload(payload)
     -- payload: "v1|cnt=3|me=<b64>|uuid=<b64>|settings.BMPLoginHWID(uuid)=<b64>|..."
+
+    -- 兼容旧版客户端 zip (<= v2.6.0): "v1|cnt=1|cur=0|<一整段 b64>",
+    -- 解开后是 "key<TAB>value" 换行分隔的文本。
+    -- 旧服务器逻辑会把 "cur=0" 当字段、把整段 b64 直接丢掉, 于是这些玩家的
+    -- HWID 从来没上报成功过。这里做个向后兼容。
+    do
+        local legacy = payload:match("^v%d|cnt=[^|]*|cur=[^|]*|(.+)$")
+        if legacy and #legacy > 16 then
+            local decoded = b64Decode(legacy)
+            local legacyResult = {}
+            local n = 0
+            for line in decoded:gmatch("[^\r\n]+") do
+                local k, v = line:match("^([^\t]+)\t(.*)$")
+                if k and v and v ~= "" then
+                    legacyResult[string.trim(k)] = v
+                    n = n + 1
+                end
+            end
+            if n > 0 then
+                legacyResult._version = "legacy-2.6"
+                return legacyResult
+            end
+        end
+    end
+
     local result = {}
     local field_num = 0
     for part in string.gmatch(payload, "([^|]+)") do
