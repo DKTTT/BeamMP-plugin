@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.7.0 (官方账号 + 机器码 + 网站验证)
+-- BMP Login Plugin v3.7.1 (官方账号 + 机器码 + 网站验证)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.7.0"
+local PLUGIN_VERSION = "3.7.1"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -1523,11 +1523,8 @@ local function _finalizeVoteKick()
             done = false,
         }
         table.insert(queue, kick_entry)
-        local fw = io.open(KICK_QUEUE_FILE, "w")
-        if fw then
-            fw:write(jsonEncode(queue))
-            fw:close()
-        end
+        -- writeJsonFile: 自带建目录 + 原子写 (直接 io.open 在全新部署上会静默失败)
+        writeJsonFile(KICK_QUEUE_FILE, queue)
         -- 立即踢出
         pcall(function() MP.DropPlayer(targetID, "投票踢出: " .. tostring(reason)) end)
     else
@@ -2123,9 +2120,13 @@ function onInit()
     if ENABLE_CHAT_LOGIN then
         print("[BMP Login] 认证模式: 内置账号 (/register /login)")
     else
-        print("[BMP Login] 认证模式: 官方账号 + 机器码"
-            .. "  (要求官方账号=" .. tostring(REQUIRE_OFFICIAL_ACCOUNT)
-            .. ", 要求机器码=" .. tostring(REQUIRE_HWID) .. ")")
+        print("[BMP Login] 认证模式: 网站注册 + 机器码验证"
+            .. "  (要求网站验证=" .. tostring(REQUIRE_WEB_VERIFY)
+            .. ", 额外要求机器码=" .. tostring(REQUIRE_HWID)
+            .. ", 额外要求官方账号=" .. tostring(REQUIRE_OFFICIAL_ACCOUNT) .. ")")
+        print("[BMP Login] 车辆上限: 授信 " .. VEHICLE_LIMITS.authenticated
+            .. " 辆 / 未授信 " .. VEHICLE_LIMITS.unauthenticated
+            .. " 辆 / 管理员 " .. VEHICLE_LIMITS.admin .. " 辆")
         local n = 0
         for _ in pairs(ADMIN_BEAMMP_IDS) do n = n + 1 end
         if n == 0 then
@@ -2453,10 +2454,12 @@ function _saveOnlinePlayers()
     end
     local ok, encoded = pcall(jsonEncode, list)
     if ok and encoded then
-        local f = io.open(ONLINE_FILE, "w")
-        if f then
-            f:write(encoded)
-            f:close()
+        -- 必须走 writeJsonFile: 它会先建目录 + 原子写。
+        -- 以前这里直接 io.open(ONLINE_FILE,"w"), 全新服务器上 bmp_login/ 还不存在时
+        -- io.open 返回 nil, 代码静默跳过 —— 网页面板就一直是空的, 而且没有任何报错。
+        local wrote, err = writeJsonFile(ONLINE_FILE, list)
+        if not wrote then
+            logWarn("_saveOnlinePlayers 写文件失败: " .. tostring(err or ONLINE_FILE))
         end
     else
         logWarn("_saveOnlinePlayers: jsonEncode failed: " .. tostring(encoded))

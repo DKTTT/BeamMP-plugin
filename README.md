@@ -334,6 +334,27 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 
 ## 📋 变更日志
 
+### v3.7.1 (2026-10-29) — 真机跑一遍揪出来的 bug
+
+拿真的 **BeamMP-Server v3.9.3（内置 Lua 5.3.5）** 加载插件跑了一次，发现两个问题：
+
+- 🐞 **全新部署时在线列表永远写不出来**：`_saveOnlinePlayers()` 直接
+  `io.open(ONLINE_FILE, "w")`，而数据目录 `bmp_login/` 在全新部署时还不存在 ——
+  `io.open` 返回 nil，代码静默跳过，**网页面板一直是空的，而且没有任何报错**。
+  `_finalizeVoteKick()` 写踢人队列也是同样写法。两处都改走
+  `writeJsonFile()`（自带建目录 + 原子写 + 失败告警）。
+  实测：干净目录启动真服务端，3 秒内自动生成 `bmp_login/online_players.json`。
+- 🐞 启动日志的「认证模式」还是旧文案（写着"官方账号 + 机器码"），
+  现在按新规则打印，并额外打印车辆上限三项。
+
+顺带在真机上确认了几件以前只是推测的事：
+
+- `MP.CreateEventTimer` 在**文件顶层**注册也能正常触发（不限于 `onInit` 里）
+- BeamMP 的 Lua 沙箱里 `os.execute` / `os.rename` / `io.open` **都可用**
+  （所以跨平台建目录和原子写是可行的）
+- v3.9.3 确实**没有** `MP.GetServerTime`，启动日志会显示"os.time() 回退"，符合预期
+- 插件在 v3.9.3 上加载零报错：`ALL SYSTEMS STARTED SUCCESSFULLY, EVERYTHING IS OKAY`
+
 ### v3.7.0 (2026-10-29) — 授信规则改为「网站注册 + verified」
 
 按最终确定的规则调整：**授信只看网站注册，官方账号/机器码降级为注册门槛。**
