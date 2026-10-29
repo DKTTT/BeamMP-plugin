@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.3.0 (官方账号 + 机器码认证)
+-- BMP Login Plugin v3.4.0 (官方账号 + 机器码认证)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.3.0"
+local PLUGIN_VERSION = "3.4.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -1202,12 +1202,21 @@ function onChatMessage(playerID, playerName, message)
 end
 
 -- ============================================================
--- 投票踢出功能
+-- 在线人数: 唯一口径
+--   以前是「进服时先数一遍 + 1」「离服时先数一遍 - 1」这种增量算法,
+--   一旦事件重复/漏发 (重连、进服过程中掉线、插件热重载) 就会永久偏移,
+--   而且 online_players.json 与聊天里的数字会对不上。
+--   现在统一「改完表再数一次」, 谁问都是同一个数。
 -- ============================================================
+function countOnlinePlayers()
+    local n = 0
+    for _ in pairs(onlinePlayers) do n = n + 1 end
+    return n
+end
+
+-- 兼容旧调用 (投票踢出用)
 local function _countOnlinePlayers()
-    local count = 0
-    for _ in pairs(onlinePlayers) do count = count + 1 end
-    return count
+    return countOnlinePlayers()
 end
 
 local function _getOnlinePlayerName(pid)
@@ -2171,10 +2180,7 @@ function onPlayerConnected(playerID)
     if ok and pname then name = pname end
     if not name then name = "Player" .. tostring(playerID) end
     
-    local count = 0
-    for _ in pairs(onlinePlayers) do count = count + 1 end
-    
-    -- 写入在线玩家列表 (供 Admin GUI 读取)
+    -- 写入在线玩家列表 (供网页面板 / Admin GUI 读取)
     local role = getPlayerRole(beamId, playerID)
     local isAuth = isPlayerAuthenticated(playerID)
     local entry = {
@@ -2189,9 +2195,12 @@ function onPlayerConnected(playerID)
     }
     onlinePlayers[playerID] = entry
     _saveOnlinePlayers()
+
+    -- 人数以写完之后重新数为准 (处理重复的 onPlayerConnected / 重连)
+    local count = countOnlinePlayers()
     
     -- Welcome message to public
-    MP.SendChatMessage(-1, " " .. tostring(name) .. " 加入了服务器！当前在线: " .. tostring(count + 1) .. " 人")
+    MP.SendChatMessage(-1, " " .. tostring(name) .. " 加入了服务器！当前在线: " .. tostring(count) .. " 人")
     
     -- Send guide privately
     sendWelcomeGuide(playerID, name)
@@ -2224,10 +2233,8 @@ function onPlayerConnected(playerID)
 end
 
 function onPlayerDisconnect(playerID)
+    local wasOnline = onlinePlayers[playerID] ~= nil
     local name = (onlinePlayers[playerID] and onlinePlayers[playerID].name) or ("Player" .. tostring(playerID))
-    local count = 0
-    for _ in pairs(onlinePlayers) do count = count + 1 end
-    if count > 0 then count = count - 1 end
 
     -- 投票踢出清理: 如果断开的玩家是投票目标或发起者, 取消投票
     if activeVoteKick then
@@ -2245,20 +2252,27 @@ function onPlayerDisconnect(playerID)
     playerPositions[playerID] = nil
 
     _saveOnlinePlayers()
-    
-    MP.SendChatMessage(-1, " " .. tostring(name) .. " 离开了服务器。当前在线: " .. tostring(count) .. " 人")
-    print("[BMP Login] 玩家离开: " .. tostring(name))
+
+    -- 人数以删完之后重新数为准。
+    -- 以前是"先数一遍再 -1": 如果这个玩家根本没进过 onlinePlayers
+    -- (进服过程中掉线 / 重复事件), 人数就会被永久少算一个。
+    local count = countOnlinePlayers()
+
+    if wasOnline then
+        MP.SendChatMessage(-1, " " .. tostring(name) .. " 离开了服务器。当前在线: " .. tostring(count) .. " 人")
+    end
+    print("[BMP Login] 玩家离开: " .. tostring(name) .. " (在列表中=" .. tostring(wasOnline)
+        .. ", 当前在线 " .. tostring(count) .. ")")
 end
 
 -- ============================================================
 -- Online Players JSON (供 Admin GUI 读取)
 -- ============================================================
 function _saveOnlinePlayers()
-    local now = os.time()
     local list = Array({})
     for pid, data in pairs(onlinePlayers) do
         if type(data) == "table" then
-            -- 实时地图 / 网页面板需要的附加字段 (onPlayerConnected 里不一定有)
+            -- 网页面板需要的附加字段 (onPlayerConnected 里不一定有)
             data.trusted = isPlayerAuthenticated(pid) and true or false
             data.is_admin = isPlayerAdmin(pid) and true or false
             data.beammp_id = getPlayerBeammpId(pid) or ""
@@ -2266,16 +2280,9 @@ function _saveOnlinePlayers()
             -- 机器码: 直接读 hwid_data (官方账号登录时 beam_id 被 BEAMMP: 前缀占住了)
             data.hwid = getPlayerHwid(pid)
 
-            local pos = playerPositions[pid]
-            if pos and (now - (pos.ts or 0)) <= POS_STALE_SECONDS then
-                data.pos = {
-                    x = pos.x, y = pos.y, z = pos.z,
-                    h = pos.h, map = pos.map or "",
-                    ts = pos.ts,
-                }
-            else
-                data.pos = nil
-            end
+            -- 位置信息: 实时地图已下线, 不再写进 JSON (playerPositions 仍在内存里,
+            -- 以后要恢复地图, 把下面几行取消注释即可)
+            data.pos = nil
 
             table.insert(list, data)
         end
@@ -2293,9 +2300,10 @@ function _saveOnlinePlayers()
 end
 
 -- ============================================================
--- 客户端位置上报 (BMPHWID:Pos)
+-- 客户端位置上报 (BMPHWID:Pos)  —— 实时地图下线后仅保留在内存
 --   payload: "x,y,z,heading,mapname"
---   服务端拿不到坐标, 全靠客户端每秒推一次
+--   要恢复地图: 在 _saveOnlinePlayers 里把 data.pos 的赋值加回来,
+--   并在 BMP_HTTP_API._players_live 里把 pos 字段放出去。
 -- ============================================================
 function onHwidPos(playerID, data)
     if not playerID or type(data) ~= "string" or data == "" then return end
@@ -2312,11 +2320,7 @@ function onHwidPos(playerID, data)
         map = (parts[5] or ""):gsub("%s+$", ""),
         ts = os.time(),
     }
-    -- 玩家发坐标时顺手刷新一次在线列表, 保证网页上的点不会等到 3 秒定时器
-    if onlinePlayers[playerID] then
-        local p = playerPositions[playerID]
-        onlinePlayers[playerID].pos = { x = p.x, y = p.y, z = p.z, h = p.h, map = p.map, ts = p.ts }
-    end
+    -- 只留在内存里, 不再写进 online_players.json (地图下线了, 也不该每秒刷盘)
 end
 
 -- ============================================================

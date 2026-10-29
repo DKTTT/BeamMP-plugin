@@ -68,7 +68,7 @@ _set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.3.0"
+VERSION = "BMP-HTTP/v1.4.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -497,7 +497,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # 网页面板: 浏览器直接打开 http://<服务器IP>:12124/
         if path in ("/", "/index.html", "/panel"):
             return self._serve_panel()
-        if path == "/api/players/live":
+        if path in ("/api/players/live", "/api/players/online"):
             return self._players_live(getattr(self, "_auth_cache", None))
         if path == "/api/chat/queue":
             return self._chat_queue(getattr(self, "_auth_cache", None))
@@ -1252,32 +1252,29 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _players_live(self, auth):
-        """实时地图 / 网页面板的数据源: 直接读 Lua 写的 online_players.json.
+        """网页面板的数据源: 直接读 Lua 写的 online_players.json.
 
-        Lua 每 3 秒 (以及每次收到坐标时) 刷新这个文件; 每个玩家条目里:
-          pos      = {x,y,z,h,map,ts}  客户端每秒推上来的坐标
-          hwid     = 机器码 (从 BeamID 里截出来的 UUID)
-          trusted  = 是否授信用户
+        Lua 在「玩家进服 / 离服 / 每 3 秒」时刷新这个文件。
+        人数一律以这个列表的长度为准, 不做任何增量计算 ——
+        这样面板上的数字和游戏里广播的"当前在线 X 人"永远是同一个。
         """
+        updated_at = None
         try:
             with FILE_LOCK:
                 raw = readJsonFile(ONLINE_FILE)
+                if os.path.exists(ONLINE_FILE):
+                    updated_at = int(os.path.getmtime(ONLINE_FILE))
         except Exception:
             raw = None
         if not isinstance(raw, list):
             raw = []
 
         players = []
-        map_name = ""
         now = int(time.time())
         for p in raw:
             if not isinstance(p, dict):
                 continue
-            pos = p.get("pos") if isinstance(p.get("pos"), dict) else None
-            if pos:
-                m = pos.get("map") or ""
-                if m and not map_name:
-                    map_name = m
+            join_ts = int(p.get("join_time") or now)
             players.append({
                 "playerID": p.get("playerID"),
                 "name": p.get("name", ""),
@@ -1289,23 +1286,30 @@ class APIHandler(BaseHTTPRequestHandler):
                 "bind_account": p.get("bind_account", ""),
                 "hwid": p.get("hwid", ""),
                 "vehicle_count": p.get("vehicle_count", 0),
-                "join_time": p.get("join_time", 0),
-                "online_seconds": max(0, now - int(p.get("join_time") or now)),
-                "pos": None if not pos else {
-                    "x": pos.get("x"), "y": pos.get("y"), "z": pos.get("z"),
-                    "h": pos.get("h", 0), "map": pos.get("map", ""),
-                    "age": max(0, now - int(pos.get("ts") or now)),
-                },
+                "join_time": join_ts,
+                "online_seconds": max(0, now - join_ts),
             })
+
+        players.sort(key=lambda x: x.get("join_time") or 0)   # 先进服的排前面
+
+        counts = {
+            "total": len(players),
+            "trusted": sum(1 for p in players if p["trusted"]),
+            "untrusted": sum(1 for p in players if not p["trusted"]),
+            "admin": sum(1 for p in players if p["is_admin"]),
+        }
+        # 文件 30 秒没更新 -> Lua 插件没在跑 / 服务器没启动
+        stale = (updated_at is None) or (now - updated_at > 30)
 
         return self._json(200, {
             "ok": True,
             "data": {
-                "count": len(players),
+                "count": counts["total"],
+                "counts": counts,
                 "players": players,
-                "map": map_name,
+                "updated_at": updated_at,
+                "stale": stale,
                 "server_time": now,
-                "auth_mode": "official" ,   # 仅供参考, 面板不依赖
             },
         })
 

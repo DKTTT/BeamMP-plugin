@@ -159,53 +159,61 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 
 ---
 
-## 🗺 网页面板 (实时地图)
+## 📋 网页面板 (在线人数 / 在线玩家)
 
-浏览器直接打开 **`http://<服务器IP>:12124/`** 就是面板，不需要另外起 web 服务。
+浏览器直接打开 **`http://<服务器IP>:12124/`**，不需要另外起 web 服务。
 
-面板分两栏：
+页面内容：
 
-- **左边实时地图**：每个在线玩家一个箭头（箭头方向 = 车头朝向），
-  颜色区分 `管理员`(金) / `授信用户`(绿) / `未授信`(灰)。
-  滚轮缩放、拖动平移、"自动适配"把所有玩家框进视野。
-- **右边玩家列表**：名字 + 徽章 + 官方账号ID + **机器码**（点一下复制）+ 车辆数 + 在线时长。
+- **顶部大数字 = 在线人数**，下面三个小计：`授信` / `未授信` / `管理员`
+- **表格**：玩家名 + 徽章、官方账号ID、**机器码（点一下复制）**、车辆数、在线时长
+- 搜索框（名字 / 机器码 / 账号ID）、按状态筛选、自动刷新 2 秒、手动刷新
+- 数据超过 30 秒没更新会在顶部弹黄色警告（说明 Lua 插件没在跑 / 服务器没开）
 
-### 坐标是怎么来的
+### 在线人数是怎么算的
 
-BeamMP **服务端 Lua 拿不到玩家坐标**，所以是客户端 mod 每秒推一次：
+只有一个口径：**`online_players.json` 里的玩家条数**。
 
 ```
-BMPHWID mod (客户端)  --TriggerServerEvent("BMPHWID:Pos")-->  main.lua onHwidPos()
-                                                              ↓
-                                                    online_players.json
-                                                              ↓
-                         BMP_HTTP_API /api/players/live  ->  面板每 1 秒拉一次
+main.lua  玩家进服/离服/每 3 秒  -->  online_players.json
+                                          ↓
+              BMP_HTTP_API  GET /api/players/live  -->  panel.html (每 2 秒)
 ```
 
-因此：**玩家必须装新版 `BMPHWID.zip`（v2.8.0+）**，地图上才会有他的点；
-老 zip 只会显示在右侧列表里（没有坐标）。超过 10 秒没更新，点会自动消失。
-
-### 底图 / 校准（可选）
-
-面板默认只画坐标网格。想叠真实地图：
-
-1. 点右上角「载入地图底图」，选一张该地图的俯视图（png/jpg）
-2. 点「校准」，填这张图对应的**世界坐标范围** `minX / maxX / minZ / maxZ`
-3. 保存 —— 存在浏览器 localStorage，下次打开还在
-
-> 校准值每张地图不同，需要自己量一次。游戏里 `/whoami` 看不到坐标，
-> 可以临时看面板上的网格读数，或者用 `Ctrl+Shift+F` 之类的调试手段取点。
-> 不校准也能用，只是没有底图。
+游戏里广播的"当前在线 X 人"和面板上的数字来自同一个函数 `countOnlinePlayers()`，
+所以两边永远一致。以前的写法是"进服时先数一遍 +1、离服时先数一遍 −1"，
+遇到重复事件或"还没进列表就掉线"会永久偏移一个，这个坑已经修掉了。
 
 ### 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 网页面板 (panel.html) |
-| GET | `/api/players/live` | 面板数据：`count` / `players[]` / `map`，含 `pos`、`hwid`、`trusted` |
+| GET | `/api/players/live` | 面板数据（别名 `/api/players/online`） |
 | GET | `/api/ping` | 健康检查 (JSON) |
 
+`/api/players/live` 返回：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "count": 4,
+    "counts": { "total": 4, "trusted": 2, "untrusted": 2, "admin": 1 },
+    "players": [ { "playerID": 1001, "name": "DKSTD", "trusted": true, "is_admin": true,
+                   "beammp_id": "acc_...", "hwid": "000003e9-...", "vehicle_count": 3,
+                   "online_seconds": 493 } ],
+    "updated_at": 1793276281,
+    "stale": false
+  }
+}
+```
+
 > `panel.html` 必须和 `BMP_HTTP_API.py` **放在同一目录**，否则 `/` 会返回 404 并提示。
+
+> 地图功能已经下线。服务端仍保留 `BMPHWID:Pos` 位置上报（只在内存里，不写盘），
+> 想恢复实时地图时在 `_saveOnlinePlayers()` 里把 `data.pos` 加回来、
+> 并在 `_players_live()` 里把 `pos` 字段放出去即可。
 
 ---
 
@@ -237,7 +245,7 @@ BMPHWID mod (客户端)  --TriggerServerEvent("BMPHWID:Pos")-->  main.lua onHwid
 ```
 BeamMP-plugin/
 ├── BMP_HTTP_API.py              # 服务器 HTTP API 后端
-├── panel.html                   # 网页面板 (实时地图) —— 必须和 API 同目录
+├── panel.html                   # 网页面板 (在线人数) —— 必须和 API 同目录
 ├── BMPHWID_Bridge.py            # 玩家认证器源码
 ├── BMP_Admin.py                 # 管理员后台源码
 ├── Resources/Server/BMPLogin/main.lua  # BeamMP 服务端 Lua 插件
@@ -247,7 +255,7 @@ BeamMP-plugin/
 │   ├── guestmap.json            # HWID → 账号映射
 │   ├── banlist.json             # 封禁列表
 │   ├── chat_queue.json          # 待广播聊天队列
-│   ├── online_players.json      # 在线玩家 + 坐标 (网页面板读它)
+│   ├── online_players.json      # 在线玩家 (网页面板读它)
 │   └── admin_audit.jsonl        # 管理员操作审计日志
 ├── dist/
 │   ├── BMPHWID_Bridge.exe       # 玩家认证器打包
@@ -288,6 +296,25 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 ---
 
 ## 📋 变更日志
+
+### v3.5.0 (2026-10-29) — 实时地图下线, 在线人数做对
+
+- 🗑 **移除实时地图**：`panel.html` 重写成纯粹的「在线人数 / 在线玩家」页面
+  （去掉了 canvas、底图、校准、坐标网格、箭头绘制）。服务端仍保留
+  `BMPHWID:Pos` 位置上报，但只在内存里、不再写盘，随时可以恢复。
+- 🔢 **在线人数口径统一**：新增 `countOnlinePlayers()`，游戏内广播与网页面板
+  走同一个数。修掉两个会让数字永久偏移的老问题：
+  - `onPlayerConnected` 用「先数一遍 + 1」，重复/重放事件会把同一个人算两次
+  - `onPlayerDisconnect` 用「先数一遍 − 1」，玩家其实没进过列表（进服过程中
+    掉线）时会少算一个，而且还会广播一条"离开了服务器"
+  现在统一改成「改完表再数一次」，并且没在列表里的断开不再广播。
+- 📊 面板升级：顶部大数字 + `授信/未授信/管理员` 三个小计、搜索框、
+  按状态筛选、自动刷新 2 秒可暂停、机器码/账号ID 点击复制、在线时长。
+- 🩺 新增数据健康度：`/api/players/live` 返回 `updated_at` 与 `stale`，
+  面板 30 秒未更新会顶黄条提示（服务器没开 / 插件没加载一眼可见）。
+- 🔌 `/api/players/live` 增加别名 `/api/players/online`；返回值新增
+  `counts{total,trusted,untrusted,admin}`，移除 `pos` 和 `map` 字段；
+  玩家列表按进服时间排序（老玩家在前）。
 
 ### v3.4.0 (2026-10-29) — 实时地图网页面板 + 未授信 1 辆车
 
