@@ -27,11 +27,15 @@
 import re, os, sys, json, hashlib, threading, socket, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 HTTP_PORT = 7788
-PAYLOAD_VER = "Bridge-v2.5"
+PAYLOAD_VER = "Bridge-v2.6"
 HTTP_NAME = f"BMPHWID_Bridge/v{VERSION}"
 WIN_TITLE = f"BeamMP 认证器 v{VERSION}  —  HWID + 命令手册 + 直连服务器"
+
+# BeamMP 官方账号恢复后, 本插件自带的"注册/登录本服账号"已停用,
+# 认证改成「官方账号 + 机器码」。改回 True 就能恢复注册/登录界面。
+ENABLE_ACCOUNT_LOGIN = False
 
 # 本地配置持久化 (服务器 URL / access_token 等, 写到 EXE 所在目录)
 def _get_cfg_path():
@@ -1134,13 +1138,27 @@ def _run_gui(hwid, sources_list):
     inner = ttk.Notebook(tab3)
     inner.pack(fill="both", expand=True, padx=10, pady=(4, 2))
 
-    def _mk_tab(parent, title):
+    def _mk_tab(parent, title, visible=True):
         f = tk.Frame(parent, bg="#ffffff")
-        inner.add(f, text=title, padding=6)
+        # visible=False 时只创建控件不挂到 Notebook 上 —— 代码照常可用, 只是不显示
+        if visible:
+            inner.add(f, text=title, padding=6)
         return f
 
+    # 官方账号恢复后, 插件自带的"注册/登录"这套已经停用 (main.lua 里 ENABLE_CHAT_LOGIN=false)
+    # 这里只隐藏界面, 后端代码保持完整, 以后要恢复把常量改回 True 即可。
+    if not ENABLE_ACCOUNT_LOGIN:
+        note = tk.Frame(tab3, bg="#eff6ff")
+        note.pack(fill="x", padx=10, pady=(2, 0))
+        tk.Label(note,
+                 text=("ℹ 现在使用 BeamMP 官方账号 + 机器码认证: "
+                       "在 BeamMP 启动器里登录官方账号, 并保持本程序运行 (自动上报机器码) 即可。"
+                       "无需再注册本服账号。"),
+                 font=("Microsoft YaHei UI", 9), bg="#eff6ff", fg="#1d4ed8",
+                 justify="left", wraplength=800).pack(anchor="w", padx=6, pady=4)
+
     # --- 子Tab: 注册 ---
-    tr = _mk_tab(inner, "  👤 注册账号  ")
+    tr = _mk_tab(inner, "  👤 注册账号  ", visible=ENABLE_ACCOUNT_LOGIN)
     _row = 0
     def _grid_entry(master, label, show=None, default="", width=32):
         nonlocal _row
@@ -1181,7 +1199,7 @@ def _run_gui(hwid, sources_list):
               ).grid(row=_row, column=1, pady=10, sticky="w", padx=8)
 
     # --- 子Tab: 登录 ---
-    tl = _mk_tab(inner, "  🔐 登录  ")
+    tl = _mk_tab(inner, "  🔐 登录  ", visible=ENABLE_ACCOUNT_LOGIN)
     _row = 0
     e_l_user = _grid_entry(tl, "账号名: ", default=CFG.get("username") or "")
     e_l_pass = _grid_entry(tl, "密码: ", show="●")

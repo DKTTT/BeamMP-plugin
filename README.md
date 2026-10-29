@@ -20,11 +20,48 @@ BeamMP 服务器账号认证系统 + 公屏聊天 + 管理员后台，支持 **�
 
 | 组件 | 文件 | 作用 |
 |---|---|---|
-| 玩家认证器 | `BMPHWID_Bridge.py` / `dist/BMPHWID_Bridge.exe` | HWID 采集 + 账号登录/注册/公屏聊天 |
+| 玩家认证器 | `BMPHWID_Bridge.py` / `dist/BMPHWID_Bridge.exe` | HWID 采集 + 公屏聊天（账号登录区已隐藏） |
 | HTTP API | `BMP_HTTP_API.py` | 服务器端 HTTP 接口，读写 `accounts.json` |
 | 管理员后台 | `BMP_Admin.py` / `dist/BMP_Admin.exe` | 账号管理/封禁/聊天广播/统计 |
-| 服务器插件 | `Resources/Server/BMPLogin/main.lua` | BeamMP 游戏内聊天认证 + 聊天队列轮询 |
+| 服务器插件 | `Resources/Server/BMPLogin/main.lua` | BeamMP 游戏内认证 + 聊天队列轮询 |
 | 启动脚本 | `start_BMP_API.bat` / `start_Bridge.bat` | 一键启动 |
+
+---
+
+## 🔑 认证方式（当前生效）
+
+BeamMP 官方账号服务器恢复后，**本插件自带的"聊天框注册/登录"已关闭**，改为
+**BeamMP 官方账号 + 机器码(HWID)** 双条件认证：
+
+| 条件 | 怎么满足 | 在 `/whoami` 里看 |
+|---|---|---|
+| 官方账号已登录 | 在 BeamMP 启动器里登录自己的账号（游客身份不算） | `官方账号: 已登录 ✓` |
+| 机器码已上报 | 开着 `BMPHWID_Bridge.exe`（客户端 mod 会主动拉取并上报） | `机器码: 已上报 ✓` |
+
+两个都满足 = 认证用户（5 辆车）；缺任意一个 = 未认证（0 辆，不能刷车）。
+管理员不看这两个条件，只认 `main.lua` 里的 `ADMIN_BEAMMP_IDS` 白名单（999 辆）。
+
+**怎么把自己设成管理员：**
+
+1. 先进一次服务器（不用认证也行），在游戏里输 `/whoami`
+2. 会显示 `官方账号ID: xxxxxxxxxxxxxxxx`，复制它
+3. 打开 `Resources/Server/BMPLogin/main.lua`，填进：
+   ```lua
+   local ADMIN_BEAMMP_IDS = {
+       ["你的官方账号ID"] = true,
+   }
+   ```
+4. 重启 BeamMP 服务器（插件在启动时会打印白名单数量；为空会打警告）
+
+**开关**（`main.lua` 顶部，改完重启服务器）：
+
+```lua
+local ENABLE_CHAT_LOGIN = false   -- 改回 true 就恢复旧的 /register /login 账号体系
+local REQUIRE_OFFICIAL_ACCOUNT = true   -- 是否要求官方账号已登录
+local REQUIRE_HWID = true               -- 是否要求机器码已上报
+```
+
+> 老的 `accounts.json` 和账号不会被删除，`ENABLE_CHAT_LOGIN = true` 之后照旧能用。
 
 ---
 
@@ -37,9 +74,11 @@ BeamMP 服务器账号认证系统 + 公屏聊天 + 管理员后台，支持 **�
 #    https://www.python.org/downloads/
 
 # 2. 编辑 start_BMP_API.bat 顶部的 CONFIG 区, 设置:
-#    ADMINS=DRIFTKING,你的管理员账号
 #    PORT=12124
 #    ALLOW_IPS=               # 可选: 限制玩家 IP 段
+#
+#    注意: 切到官方账号认证后, ADMINS= 里的账号名不再用于游戏内权限,
+#          游戏内管理员请在 main.lua 的 ADMIN_BEAMMP_IDS 里配置。
 
 # 3. 防火墙放行 12124 端口 (管理员 PowerShell)
 New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP -LocalPort 12124 -Action Allow
@@ -54,12 +93,12 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 ### 玩家（使用）
 
 ```
-1. 双击 dist/BMPHWID_Bridge.exe
-2. 切 Tab3「直连服务器」
-3. 顶部 API 地址填服主给的地址 (如 http://118.xxx.xxx.xxx:12124)
-4. 点「测试连通」→ 灯变绿
-5. 注册/登录 → 自动获取认证身份 (5 辆车)
-6. Tab3「公屏聊天」→ 发消息直接到游戏公屏, 不用开游戏
+1. 在 BeamMP 启动器里登录你的官方账号 (游客身份无法认证)
+2. 双击 dist/BMPHWID_Bridge.exe  (保持开着, 它负责上报机器码)
+3. 进服后在游戏里输 /whoami, 确认两项都是 ✓
+4. 机器码由客户端的 BMPHWID mod 自动拉取并上报, 一般几秒内完成
+5. 想用公屏聊天: 切 Tab3「直连服务器」填 API 地址 → Tab「公屏聊天」
+   (未登录本服账号时会显示为 guest, 登录后显示账号名)
 ```
 
 ---
@@ -111,9 +150,11 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 
 | 角色 | 车辆上限 | 获得方式 |
 |---|---|---|
-| 管理员 | 999 | `accounts.json` 的 `is_admin` / `--admins` 参数 |
-| 已认证玩家 | 5 | 登录账号 + 绑定 HWID |
-| 未认证游客 | 0 | 不登录直接进服 (禁止刷车) |
+| 管理员 | 999 | 官方账号 ID 在 `main.lua` 的 `ADMIN_BEAMMP_IDS` 白名单里 |
+| 已认证玩家 | 5 | BeamMP 官方账号已登录 **且** 机器码已上报 |
+| 未认证游客 | 0 | 缺任意一个条件 (禁止刷车) |
+
+> 旧账号模式 (`ENABLE_CHAT_LOGIN = true`) 下仍然是: 管理员 999 / 已登录账号 5 / 游客 0。
 
 ---
 
@@ -193,6 +234,29 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 ---
 
 ## 📋 变更日志
+
+### v3.3.0 (2026-10-29) — 切换为 "BeamMP 官方账号 + 机器码" 认证
+
+官方账号服务器恢复，内置的聊天框账号体系先关掉。
+
+- ⚙️ `main.lua` 新增开关 `ENABLE_CHAT_LOGIN = false`：`/register` `/login` `/logout`
+  会给出一句说明并拒绝执行；`/help` 不再列出这几条命令；欢迎指引改成认证流程。
+  改回 `true` 即可完整恢复旧账号体系（`accounts.json` 原样保留，不删数据）。
+- ⚙️ 认证判定改为 **官方账号已登录 (`!isGuest`) 且 机器码已上报**：
+  - 新增 `hasOfficialAccount()` / `hasStableHwid()` 两个独立判定
+  - 用 `REQUIRE_OFFICIAL_ACCOUNT` / `REQUIRE_HWID` 可以单独关掉某一项排查问题
+  - 旧模式下的 accounts.json 自动登录、`bound_account` 判定在官方模式下不再参与
+- ⚙️ 管理员改成 **官方账号 ID 白名单** `ADMIN_BEAMMP_IDS`：
+  - ID 来自 `onPlayerAuth` 的 `identifiers.beammp`，改不了名、冒充不了
+  - 玩家在游戏里输 `/whoami` 就能看到自己的 ID，复制进 main.lua 即可
+  - 空白名单会在启动日志里打醒目警告（防止把自己锁在门外）
+  - `/listadmins` 在官方模式下直接列出白名单 ID；`/addadmin` `/removeadmin` 提示改用配置
+- 🐞 `/vehiclelimit` `/onVehicleSpawn` 的提示按模式区分：官方模式下会直接告诉玩家
+  **还缺哪一步**（"还需要: 在 BeamMP 登录官方账号 + 启动 BMPHWID_Bridge.exe 上报机器码"），
+  而不是让人去 `-login`。
+- 🐞 `/whoami` 在官方模式下逐项显示 `官方账号: 已登录 ✓ / 机器码: 已上报 ✓` 和自己的官方账号 ID。
+- ⚙️ Bridge v2.6.0：`ENABLE_ACCOUNT_LOGIN = False` 时隐藏「注册账号」「登录」两个子页，
+  换成一行说明；后端接口与代码保持完整，改回 `True` 即恢复。
 
 ### v3.2.0 (2026-10-29) — 第二轮: 客户端 mod + 界面卡死 + 冒名漏洞
 

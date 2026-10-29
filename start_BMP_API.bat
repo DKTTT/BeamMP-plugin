@@ -9,6 +9,9 @@ chcp 936 >nul
 REM ---------- CONFIG (edit to your needs) ----------
 set HOST=0.0.0.0
 set PORT=12124
+REM NOTE: after switching to BeamMP official-account auth (main.lua ENABLE_CHAT_LOGIN=false),
+REM       this ADMINS list no longer grants in-game admin rights.
+REM       In-game admins are configured in Resources\Server\BMPLogin\main.lua -> ADMIN_BEAMMP_IDS.
 set ADMINS=DRIFTKING
 set DATA_DIR=bmp_login
 REM Optional IP whitelist (comma-separated), empty = allow all

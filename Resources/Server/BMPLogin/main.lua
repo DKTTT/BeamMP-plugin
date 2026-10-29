@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.1.1 (完整管理员版)
+-- BMP Login Plugin v3.2.0 (官方账号 + 机器码认证)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.1.1"
+local PLUGIN_VERSION = "3.2.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -13,6 +13,34 @@ local GUEST_MAP_FILE = DATA_DIR .. "/guest_map.json"
 local ONLINE_FILE = DATA_DIR .. "/online_players.json"
 local KICK_QUEUE_FILE = DATA_DIR .. "/kick_queue.json"
 local VOTE_QUEUE_FILE = DATA_DIR .. "/vote_queue.json"
+
+-- ============================================================
+-- 认证模式开关  ★ 部署前先看这里 ★
+--
+--   BeamMP 官方账号服务器恢复后, 插件自带的"聊天框注册/登录"可以关掉,
+--   改为走 **官方账号 + 机器码(HWID)**:
+--     认证用户 = 官方账号已登录 (!isGuest)  **且**  Bridge 上报了机器码
+--
+--   把 ENABLE_CHAT_LOGIN 改回 true 即可恢复旧的 /register /login 账号体系
+--   (accounts.json 里的老账号仍然保留, 不会被删)。
+-- ============================================================
+local ENABLE_CHAT_LOGIN = false   -- 内置聊天框注册/登录 (官方账号可用后关闭)
+
+-- 认证判定: 两个开关可以单独关掉, 方便排查问题
+local REQUIRE_OFFICIAL_ACCOUNT = true   -- 必须官方账号已登录 (!isGuest)
+local REQUIRE_HWID = true               -- 必须 Bridge 上报过机器码
+
+-- 管理员白名单: BeamMP **官方账号 ID** (onPlayerAuth 里的 identifiers.beammp)
+--   玩家在游戏里输 /whoami 就能看到自己的"官方账号ID", 复制过来填进去。
+--   注意这里不是显示名 —— 显示名可以随便改, ID 改不了, 不会被冒充。
+local ADMIN_BEAMMP_IDS = {
+    -- ["0123456789abcdef0123456789abcdef"] = true,
+}
+
+-- 聊天登录关闭后, 玩家输 /register /login 时给的提示 (所有命令复用同一句)
+local CHAT_LOGIN_OFF_MSG =
+    "内置账号登录已关闭, 现在使用 BeamMP 官方账号 + 机器码认证. "
+    .. "请在 BeamMP 里登录官方账号, 并启动 BMPHWID_Bridge.exe 上报机器码, 然后用 /whoami 查看状态"
 
 local accounts = {}
 local banlist = {}
@@ -618,9 +646,30 @@ end
 -- (_ENV.getPlayerStableInfo == nil), 运行时直接 "attempt to call a nil value",
 -- 导致所有管理员命令和投票踢出全部失效。
 local getPlayerStableInfo
+-- 同理: 认证判定也要前置声明, getPlayerRole 在它前面
+local isPlayerAuthenticated
+
+-- 取玩家的 BeamMP 官方账号 ID (onPlayerAuth 的 identifiers.beammp)
+local function getPlayerBeammpId(playerID)
+    if not playerID then return nil end
+    local ac = playerAuthCache and playerAuthCache[playerID]
+    if ac and ac.beammp_id and ac.beammp_id ~= "" then return ac.beammp_id end
+    -- 回退: beamId 形如 "BEAMMP:xxxx"
+    local ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
+    if ok and type(beam_id) == "string" then
+        local id = beam_id:match("^BEAMMP:(.+)$")
+        if id and id ~= "" then return id end
+    end
+    return nil
+end
 
 local function getPlayerRole(beamId, playerID)
     if not beamId then return "游客" end
+    -- 官方账号 + 机器码模式: 角色完全由认证判定决定
+    if not ENABLE_CHAT_LOGIN then
+        if playerID and isPlayerAuthenticated(playerID) then return "玩家" end
+        return "游客"
+    end
     -- 方法 1: accounts 直接以 beamId 为 key (老格式)
     if accounts[beamId] then return "玩家" end
     -- 方法 2: 通过 playerAuthCache.bound_account 检查 (登录后绑定)
@@ -633,15 +682,23 @@ end
 
 -- ============================================================
 -- Admin Check (管理员权限判定)
---   优先使用 accounts.json 中的 is_admin 字段
---   回退使用硬编码的 ADMIN_WHITELIST
+--   官方账号模式: 只看 ADMIN_BEAMMP_IDS (BeamMP 官方账号 ID 白名单)
+--   旧账号模式  : accounts.json 的 is_admin + ADMIN_WHITELIST
 -- ============================================================
 local ADMIN_WHITELIST = {
-    -- 在此处添加管理员账号 (小写), 例如: "driftking" = true
+    -- 仅 ENABLE_CHAT_LOGIN=true 时生效: 在此添加管理员账号 (小写), 例如: "driftking" = true
 }
 
 local function isPlayerAdmin(playerID)
     if not playerID then return false end
+
+    -- ---- 官方账号模式 ----
+    if not ENABLE_CHAT_LOGIN then
+        local bid = getPlayerBeammpId(playerID)
+        if bid and ADMIN_BEAMMP_IDS[bid] then return true end
+        return false
+    end
+
     local beamId = getPlayerStableInfo(playerID)
     if not beamId then return false end
     local role = getPlayerRole(beamId, playerID)
@@ -694,8 +751,54 @@ local VEHICLE_LIMITS = {
     unauthenticated = 0,  -- 未认证用户 (禁止刷车)
 }
 
-local function isPlayerAuthenticated(playerID)
+-- Bridge 是否上报过机器码
+local function hasStableHwid(playerID)
     if not playerID then return false end
+    local ac = playerAuthCache and playerAuthCache[playerID]
+    if ac and type(ac.hwid_data) == "table" then
+        for k, v in pairs(ac.hwid_data) do
+            -- "_version"/"_count" 只是元信息, 不算机器码
+            if type(k) == "string" and k:sub(1, 1) ~= "_"
+                    and v and tostring(v):match("%S") then
+                return true
+            end
+        end
+    end
+    -- beam_id 以 "HWID:" 开头 = 客户端上报的稳定机器码
+    local ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
+    if ok and beam_id and tostring(beam_id):match("^HWID:") then
+        return true
+    end
+    return false
+end
+
+-- 是否登录了 BeamMP 官方账号 (onPlayerAuth 的 isGuest == false)
+local function hasOfficialAccount(playerID)
+    if not playerID then return false end
+    local ac = playerAuthCache and playerAuthCache[playerID]
+    if ac and ac.official_account ~= nil then
+        return ac.official_account == true
+    end
+    -- 没有 onPlayerAuth 记录时, 退一步看 beamId 是不是 BEAMMP:xxx
+    local ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
+    return ok and type(beam_id) == "string" and beam_id:match("^BEAMMP:") ~= nil
+end
+
+isPlayerAuthenticated = function(playerID)
+    if not playerID then return false end
+
+    -- ---- 官方账号 + 机器码模式 ----
+    if not ENABLE_CHAT_LOGIN then
+        if REQUIRE_OFFICIAL_ACCOUNT and not hasOfficialAccount(playerID) then
+            return false
+        end
+        if REQUIRE_HWID and not hasStableHwid(playerID) then
+            return false
+        end
+        return true
+    end
+
+    -- ---- 旧模式 (插件自带账号) ----
     -- 方法 1: playerAuthCache 有 hwid_data
     if playerAuthCache and playerAuthCache[playerID] and playerAuthCache[playerID].hwid_data then
         local hwid_data = playerAuthCache[playerID].hwid_data
@@ -871,17 +974,30 @@ end
 -- ============================================================
 local function sendWelcomeGuide(playerID, playerName)
     local msg = {}
-    msg[1] = " =========== 登录指引 ==========="
-    msg[2] = " 欢迎来到服务器！请使用以下命令注册或登录："
-    msg[3] = " /register <账号> <密码> - 注册新账号"
-    msg[4] = " /login <账号> <密码> - 登录已有账号"
-    msg[5] = " /whoami - 查看登录状态"
-    msg[6] = " /vehiclelimit - 查看车辆上限"
-    msg[7] = " /bmpid <UUID> - 绑定稳定机器码 (认证后 5 辆)"
-    msg[8] = " /help - 查看所有命令"
-    msg[9] = " ================================"
-    msg[10] = " [车辆限制] 未认证用户 1 辆, 认证用户 5 辆"
-    msg[11] = " [认证方式] /bmpid UUID + /login 账号 密码"
+    if not ENABLE_CHAT_LOGIN then
+        msg[1] = " =========== 认证指引 ==========="
+        msg[2] = " 欢迎来到服务器！本服使用 BeamMP 官方账号 + 机器码认证"
+        msg[3] = " 1) 在 BeamMP 启动器里登录你的官方账号 (游客身份无法认证)"
+        msg[4] = " 2) 启动 BMPHWID_Bridge.exe, 它会自动上报你的机器码"
+        msg[5] = " /whoami - 查看还缺哪一步"
+        msg[6] = " /vehiclelimit - 查看车辆上限"
+        msg[7] = " /help - 查看所有命令"
+        msg[8] = " ================================"
+        msg[9] = " [车辆限制] 未认证 0 辆, 认证 5 辆, 管理员 999 辆"
+        msg[10] = " [认证条件] 官方账号已登录 + 机器码已上报"
+    else
+        msg[1] = " =========== 登录指引 ==========="
+        msg[2] = " 欢迎来到服务器！请使用以下命令注册或登录："
+        msg[3] = " /register <账号> <密码> - 注册新账号"
+        msg[4] = " /login <账号> <密码> - 登录已有账号"
+        msg[5] = " /whoami - 查看登录状态"
+        msg[6] = " /vehiclelimit - 查看车辆上限"
+        msg[7] = " /bmpid <UUID> - 绑定稳定机器码 (认证后 5 辆)"
+        msg[8] = " /help - 查看所有命令"
+        msg[9] = " ================================"
+        msg[10] = " [车辆限制] 未认证用户 1 辆, 认证用户 5 辆"
+        msg[11] = " [认证方式] /bmpid UUID + /login 账号 密码"
+    end
 
     for _, m in ipairs(msg) do
         MP.SendChatMessage(playerID, m)
@@ -1338,7 +1454,11 @@ function _handleChat(playerID, playerName, message)
     -- Guest reminder
     if role == "游客" then
         if message:sub(1, 1) ~= "/" then
-            MP.SendChatMessage(playerID, " 提示: 你尚未登录。使用 /help 查看可用命令")
+            if ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " 提示: 你尚未登录。使用 /help 查看可用命令")
+            else
+                MP.SendChatMessage(playerID, " 提示: 你还没通过认证 (需官方账号登录 + 机器码), 输入 /whoami 查看")
+            end
         end
     end
     
@@ -1361,10 +1481,12 @@ function _handleChat(playerID, playerName, message)
         
         if cmd == "/help" then
             MP.SendChatMessage(playerID, " =========== 玩家命令 ===========")
-            MP.SendChatMessage(playerID, " /register <账号> <密码> - 注册新账号")
-            MP.SendChatMessage(playerID, " /login <账号> <密码> - 登录账号")
-            MP.SendChatMessage(playerID, " /logout - 退出登录")
-            MP.SendChatMessage(playerID, " /whoami - 查看登录状态")
+            if ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " /register <账号> <密码> - 注册新账号")
+                MP.SendChatMessage(playerID, " /login <账号> <密码> - 登录账号")
+                MP.SendChatMessage(playerID, " /logout - 退出登录")
+            end
+            MP.SendChatMessage(playerID, " /whoami - 查看认证状态")
             MP.SendChatMessage(playerID, " /vehiclelimit - 查看车辆上限")
             MP.SendChatMessage(playerID, " /bmpid <payload> - 客户端HWID回传")
             MP.SendChatMessage(playerID, " =========== 投票踢出 ===========")
@@ -1383,6 +1505,10 @@ function _handleChat(playerID, playerName, message)
             end
 
         elseif cmd == "/register" then
+            if not ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " " .. CHAT_LOGIN_OFF_MSG)
+                return
+            end
             local uname, pwd = args:match("^(%S+)%s+(%S+)$")
             if uname and pwd then
                 registerAccount(playerID, uname, pwd)
@@ -1391,6 +1517,10 @@ function _handleChat(playerID, playerName, message)
             end
 
         elseif cmd == "/login" then
+            if not ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " " .. CHAT_LOGIN_OFF_MSG)
+                return
+            end
             local uname, pwd = args:match("^(%S+)%s+(%S+)$")
             if uname and pwd then
                 loginAccount(playerID, uname, pwd)
@@ -1399,6 +1529,10 @@ function _handleChat(playerID, playerName, message)
             end
 
         elseif cmd == "/logout" then
+            if not ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " " .. CHAT_LOGIN_OFF_MSG)
+                return
+            end
             logoutAccount(playerID)
 
         elseif cmd == "/whoami" then
@@ -1407,6 +1541,25 @@ function _handleChat(playerID, playerName, message)
             local limit = getPlayerVehicleLimit(playerID)
             local authLabel = isPlayerAuthenticated(playerID) and "已认证" or "未认证"
             MP.SendChatMessage(playerID, " 身份: " .. role .. "  认证状态: " .. authLabel .. "  车辆上限: " .. limit .. " 辆")
+
+            if not ENABLE_CHAT_LOGIN then
+                -- 官方账号 + 机器码模式: 逐项告诉玩家缺什么
+                local official = hasOfficialAccount(playerID)
+                local hwid = hasStableHwid(playerID)
+                local bid = getPlayerBeammpId(playerID)
+                MP.SendChatMessage(playerID, " 官方账号: " .. (official and "已登录 ✓" or "未登录 ✗")
+                    .. "   机器码: " .. (hwid and "已上报 ✓" or "未上报 ✗"))
+                if bid then
+                    MP.SendChatMessage(playerID, " 官方账号ID: " .. tostring(bid))
+                end
+                if not official then
+                    MP.SendChatMessage(playerID, " 请先在 BeamMP 里用官方账号登录再进服")
+                end
+                if not hwid then
+                    MP.SendChatMessage(playerID, " 请启动 BMPHWID_Bridge.exe (机器码上报后才能认证)")
+                end
+            end
+
             if beamId then
                 MP.SendChatMessage(playerID, " 绑定标识: " .. tostring(beamId))
             end
@@ -1607,6 +1760,19 @@ function _handleChat(playerID, playerName, message)
             end
             MP.SendChatMessage(playerID, " ======== 管理员列表 ========")
             local count = 0
+            if not ENABLE_CHAT_LOGIN then
+                -- 官方账号模式: 管理员写死在 ADMIN_BEAMMP_IDS
+                for bid, _ in pairs(ADMIN_BEAMMP_IDS) do
+                    count = count + 1
+                    MP.SendChatMessage(playerID, "  - 官方账号ID " .. tostring(bid))
+                end
+                if count == 0 then
+                    MP.SendChatMessage(playerID, " (白名单为空! 请在 main.lua 的 ADMIN_BEAMMP_IDS 里填自己的官方账号ID)")
+                else
+                    MP.SendChatMessage(playerID, " 共 " .. tostring(count) .. " 个管理员")
+                end
+                return
+            end
             for uname, acc in pairs(accounts) do
                 if type(acc) == "table" and acc.is_admin then
                     count = count + 1
@@ -1623,14 +1789,18 @@ function _handleChat(playerID, playerName, message)
                 MP.SendChatMessage(playerID, " 共 " .. tostring(count) .. " 个管理员")
             end
 
-        elseif cmd == "/addadmin" then
+        elseif cmd == "/addadmin" or cmd == "/removeadmin" then
+            if not ENABLE_CHAT_LOGIN then
+                MP.SendChatMessage(playerID, " 内置账号已关闭, 管理员请在 main.lua 的 ADMIN_BEAMMP_IDS 里配置")
+                return
+            end
             if not isPlayerAdmin(playerID) then
                 MP.SendChatMessage(playerID, " 你没有权限使用此命令")
                 return
             end
             local target = args:match("^(%S+)")
             if not target then
-                MP.SendChatMessage(playerID, " 用法: /addadmin <账号>")
+                MP.SendChatMessage(playerID, " 用法: " .. cmd .. " <账号>")
                 return
             end
             -- 查找账号 (大小写不敏感)
@@ -1641,50 +1811,34 @@ function _handleChat(playerID, playerName, message)
                     break
                 end
             end
-            if found_key then
-                accounts[found_key].is_admin = true
-                saveAccounts()
-                MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已设为管理员")
-                print("[BMP Login] 管理员 " .. tostring(playerName) .. " 提升 " .. found_key .. " 为管理员")
-            else
-                MP.SendChatMessage(playerID, " 账号 " .. target .. " 不存在")
-            end
-
-        elseif cmd == "/removeadmin" then
-            if not isPlayerAdmin(playerID) then
-                MP.SendChatMessage(playerID, " 你没有权限使用此命令")
-                return
-            end
-            local target = args:match("^(%S+)")
-            if not target then
-                MP.SendChatMessage(playerID, " 用法: /removeadmin <账号>")
-                return
-            end
-            -- 查找账号 (大小写不敏感)
-            local found_key = nil
-            for k, _ in pairs(accounts) do
-                if k:lower() == target:lower() then
-                    found_key = k
-                    break
+            if cmd == "/addadmin" then
+                if found_key then
+                    accounts[found_key].is_admin = true
+                    saveAccounts()
+                    MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已设为管理员")
+                    print("[BMP Login] 管理员 " .. tostring(playerName) .. " 提升 " .. found_key .. " 为管理员")
+                else
+                    MP.SendChatMessage(playerID, " 账号 " .. target .. " 不存在")
                 end
-            end
-            local found_whitelist = nil
-            for wk, _ in pairs(ADMIN_WHITELIST) do
-                if wk:lower() == target:lower() then
-                    found_whitelist = wk
-                    break
-                end
-            end
-            if found_key then
-                accounts[found_key].is_admin = false
-                saveAccounts()
-                MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已移除管理员权限")
-                print("[BMP Login] 管理员 " .. tostring(playerName) .. " 移除 " .. found_key .. " 的管理员权限")
-            elseif found_whitelist then
-                ADMIN_WHITELIST[found_whitelist] = nil
-                MP.SendChatMessage(playerID, " 账号 " .. found_whitelist .. " 已从白名单移除")
             else
-                MP.SendChatMessage(playerID, " 账号 " .. target .. " 不是管理员")
+                local found_whitelist = nil
+                for wk, _ in pairs(ADMIN_WHITELIST) do
+                    if wk:lower() == target:lower() then
+                        found_whitelist = wk
+                        break
+                    end
+                end
+                if found_key then
+                    accounts[found_key].is_admin = false
+                    saveAccounts()
+                    MP.SendChatMessage(playerID, " 账号 " .. found_key .. " 已移除管理员权限")
+                    print("[BMP Login] 管理员 " .. tostring(playerName) .. " 移除 " .. found_key .. " 的管理员权限")
+                elseif found_whitelist then
+                    ADMIN_WHITELIST[found_whitelist] = nil
+                    MP.SendChatMessage(playerID, " 账号 " .. found_whitelist .. " 已从白名单移除")
+                else
+                    MP.SendChatMessage(playerID, " 账号 " .. target .. " 不是管理员")
+                end
             end
 
         else
@@ -1756,6 +1910,22 @@ function onInit()
     print("[BMP Login] ========================================")
     print("[BMP Login] 事件: onPlayerAuth, onPlayerJoining, onPlayerConnected, onPlayerDisconnect, onChatMessage")
     print("[BMP Login] 数据目录: " .. DATA_DIR)
+    -- 认证模式 (部署后第一眼要能看出来)
+    if ENABLE_CHAT_LOGIN then
+        print("[BMP Login] 认证模式: 内置账号 (/register /login)")
+    else
+        print("[BMP Login] 认证模式: 官方账号 + 机器码"
+            .. "  (要求官方账号=" .. tostring(REQUIRE_OFFICIAL_ACCOUNT)
+            .. ", 要求机器码=" .. tostring(REQUIRE_HWID) .. ")")
+        local n = 0
+        for _ in pairs(ADMIN_BEAMMP_IDS) do n = n + 1 end
+        if n == 0 then
+            print("[BMP Login] *** 警告: ADMIN_BEAMMP_IDS 是空的, 游戏内没有任何管理员! ***")
+            print("[BMP Login] *** 进服后输 /whoami 看到自己的官方账号ID, 填进 main.lua 的 ADMIN_BEAMMP_IDS ***")
+        else
+            print("[BMP Login] 管理员白名单: " .. n .. " 个官方账号ID")
+        end
+    end
     -- BeamMP v3.9.4+ 适配状态
     if HAS_SERVER_TIME then
         print("[BMP Login] 时间源: MP.GetServerTime() (BeamMP v3.9.4+ 单调时钟)")
@@ -1869,6 +2039,11 @@ function onPlayerAuth(player_name, role, isGuest, identifiers)
                 ip = ip,
                 ts = nowTs,
                 name = player_name,
+                -- 官方账号模式要用的两个字段
+                beammp_id = (identifiers and type(identifiers) == "table" and type(identifiers.beammp) == "string")
+                            and identifiers.beammp or nil,
+                official = (isGuest == false) or (isGuest == nil and identifiers ~= nil
+                            and type(identifiers) == "table" and type(identifiers.beammp) == "string"),
             }
         end
     end
@@ -1897,31 +2072,37 @@ function onPlayerJoining(playerID)
         if pending.ip then
             playerAuthCache[playerID].auth_ip = pending.ip
         end
+        -- 官方账号信息 (认证判定 / 管理员白名单都依赖它)
+        playerAuthCache[playerID].beammp_id = pending.beammp_id
+        playerAuthCache[playerID].official_account = pending.official == true
         if pending.name then pendingAuthByName[pending.name] = nil end
         print("[BMP Login] onPlayerJoining(#" .. tostring(playerID) .. "): 从 onPlayerAuth 携带 pending beam_id="
-            .. tostring(pending.beam_id) .. " name=" .. tostring(curName))
+            .. tostring(pending.beam_id) .. " official=" .. tostring(pending.official)
+            .. " beammp_id=" .. tostring(pending.beammp_id) .. " name=" .. tostring(curName))
     end
     
     local beamId, ip, name = getPlayerStableInfo(playerID)
     
-    -- Check auto-login
+    -- Check auto-login (仅旧账号模式; 官方账号模式下 accounts.json 不再参与认证)
     -- 支持 3 种匹配方式（优先级：beamId -> IP兜底 -> NAME兜底）：
     --   1. boundId == 当前 beamId            （命中 HWID 或 BEAMMP: 官方 ID 时）
     --   2. boundId == "IP:" .. playerIp      （登录过一次后，IP 没变 + guest 数字变了也能命中）
     --   3. boundId == "NAME:" .. playerName  （玩家强制改了 BeamMP launcher 登录名回退绑定）
     local autoUser, autoVia, autoBound = nil, nil, nil
-    for username, account in pairs(accounts) do
-        for _, boundId in ipairs(account.bind_beam_ids or {}) do
-            if boundId == beamId then
-                autoUser, autoVia, autoBound = username, "稳定ID", boundId
-            elseif ip and boundId == "IP:" .. ip then
-                autoUser, autoVia, autoBound = username, "IP兜底", boundId
-            elseif name and boundId == "NAME:" .. name then
-                autoUser, autoVia, autoBound = username, "NAME兜底", boundId
+    if ENABLE_CHAT_LOGIN then
+        for username, account in pairs(accounts) do
+            for _, boundId in ipairs(account.bind_beam_ids or {}) do
+                if boundId == beamId then
+                    autoUser, autoVia, autoBound = username, "稳定ID", boundId
+                elseif ip and boundId == "IP:" .. ip then
+                    autoUser, autoVia, autoBound = username, "IP兜底", boundId
+                elseif name and boundId == "NAME:" .. name then
+                    autoUser, autoVia, autoBound = username, "NAME兜底", boundId
+                end
+                if autoUser then break end
             end
             if autoUser then break end
         end
-        if autoUser then break end
     end
     if autoUser then
         playerAuthCache[playerID] = playerAuthCache[playerID] or {}
@@ -2354,7 +2535,17 @@ function onVehicleSpawn(playerID, vehicleID, vehicleData)
 
     -- 未认证玩家: 禁止刷车
     if role == "游客" or not isAuth then
-        local msg = " 您尚未登录, 无法生成车辆. 请先 /login <账号> <密码> 登录账号后即可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+        local msg
+        if ENABLE_CHAT_LOGIN then
+            msg = " 您尚未登录, 无法生成车辆. 请先 /login <账号> <密码> 登录账号后即可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+        else
+            -- 官方账号模式: 告诉玩家到底缺哪一步
+            local missing = {}
+            if not hasOfficialAccount(playerID) then missing[#missing + 1] = "在 BeamMP 登录官方账号" end
+            if not hasStableHwid(playerID) then missing[#missing + 1] = "启动 BMPHWID_Bridge.exe 上报机器码" end
+            if #missing == 0 then missing[#missing + 1] = "稍等几秒, 机器码正在验证" end
+            msg = " 你还没有通过认证, 暂时不能生成车辆. 还需要: " .. table.concat(missing, " + ")
+        end
         MP.SendChatMessage(playerID, msg)
         logDebug("onVehicleSpawn 拦截游客 #" .. tostring(playerID))
         return 1
