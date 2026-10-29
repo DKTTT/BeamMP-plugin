@@ -8,7 +8,7 @@
 -- ============================================================
 
 local MOD = "bmpHwidProbe"
-local VER = "2.7.0"
+local VER = "2.8.0"
 local SERVER_EVENT = "BMPHWID:HWIDReply"
 local REQUEST_EVENT = "BMPHWID:RequestHWID"
 local BRIDGE_URL = "http://127.0.0.1:7788"
@@ -457,10 +457,65 @@ local function runOnce()
     return false
 end
 
+-- ============================================================
+-- 实时地图: 把自己的坐标上报给服务器
+--   BeamMP 服务端 Lua 拿不到玩家位置, 只能客户端每秒推一次。
+--   发到 "BMPHWID:Pos", payload = "x,y,z,heading,levelName"
+--   服务端 main.lua 的 onHwidPos() 收到后写进 online_players.json,
+--   网页面板 (BMP_HTTP_API 的 GET /) 读这个文件画地图上的点。
+-- ============================================================
+local POS_EVENT = "BMPHWID:Pos"
+local POS_INTERVAL = 1.0     -- 秒
+local posAcc = 0
+
+local function levelNameSafe()
+    local ok, v = pcall(function() return be:getLevelName() end)
+    if ok and type(v) == "string" then return (v:gsub("[/,]", "_")) end
+    return ""
+end
+
+local function vehicleSafe()
+    local veh = nil
+    pcall(function() veh = be:getPlayerVehicle(0) end)
+    return veh
+end
+
+local function reportPosition(delta)
+    posAcc = posAcc + (delta or 0)
+    if posAcc < POS_INTERVAL then return end
+    posAcc = 0
+
+    local api = probeBeamMP()
+    if not api.triggerFn then return end          -- 还没连上服务器
+    local veh = vehicleSafe()
+    if not veh then return end                    -- 没车 (观战/刚进图)
+
+    local pos = nil
+    pcall(function() pos = veh:getPosition() end)
+    if not pos or not pos.x or not pos.z then return end
+
+    -- BeamNG 坐标: y 是高度, 平面用 x/z
+    local h = 0
+    pcall(function()
+        local d = veh:getDirectionVector()
+        if d and d.x then
+            h = math.deg(math.atan2(d.x, d.z))
+        end
+    end)
+
+    local payload = string.format("%.2f,%.2f,%.2f,%.1f,%s",
+        pos.x, pos.y, pos.z, h, levelNameSafe())
+    pcall(api.triggerFn, POS_EVENT, payload)
+end
+
 local function onUpdate(dt, dtSim, dtRaw)
-    if state.sendSucceeded then return end
     -- BeamNG engine passes (dt) or (dtReal, dtSim, dtRaw); use first numeric arg
     local delta = tonumber(dt) or tonumber(dtSim) or 0
+
+    -- 坐标上报与 HWID 握手互不影响: 即使 HWID 已经发成功也要继续上报
+    pcall(reportPosition, delta)
+
+    if state.sendSucceeded then return end
     state.tElapsed = state.tElapsed + delta
     local sched = {2, 3, 5, 8, 12, 18, 25, 35, 45, 55, 62, 70, 80, 95}
     if state.attempts < #sched and state.tElapsed >= sched[state.attempts + 1] then

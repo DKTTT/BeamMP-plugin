@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.2.0 (官方账号 + 机器码认证)
+-- BMP Login Plugin v3.3.0 (官方账号 + 机器码认证)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.2.0"
+local PLUGIN_VERSION = "3.3.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -747,9 +747,49 @@ end
 -- ============================================================
 local VEHICLE_LIMITS = {
     admin = 999,          -- 管理员 (与 README / HTTP API 的 999 保持一致)
-    authenticated = 5,    -- 认证用户
-    unauthenticated = 0,  -- 未认证用户 (禁止刷车)
+    authenticated = 5,    -- 授信用户 (官方账号 + 机器码)
+    unauthenticated = 1,  -- 未授信用户: 给 1 辆, 至少能开一辆, 不至于完全玩不了
 }
+
+-- 地图位置上报: 客户端 BMPHWID mod 每秒 TriggerServerEvent("BMPHWID:Pos")
+-- 服务端 Lua **拿不到**玩家坐标, 只能由客户端推上来
+local playerPositions = {}   -- playerID -> { x, y, z, h, map, ts }
+local POS_STALE_SECONDS = 10 -- 超过这么久没更新就当位置失效
+
+-- 取玩家的机器码原文 (给网页面板显示/复制用)
+--   注意: 不能从 beam_id 里截 —— 官方账号登录时 P0 会把 beam_id 固定成
+--   "BEAMMP:xxx", 机器码根本不在里面。必须直接读 hwid_data。
+local HWID_PRIORITY_KEYS = {
+    "settings.BMPLoginHWID(uuid)",
+    "uuid",
+    "beammp_launcher_hwid",
+    "bmpid_raw",
+    "FS:getUserPath()",
+    "core_env_fingerprint",
+}
+
+local function getPlayerHwid(playerID)
+    if not playerID then return "" end
+    local ac = playerAuthCache and playerAuthCache[playerID]
+    if ac and type(ac.hwid_data) == "table" then
+        for _, k in ipairs(HWID_PRIORITY_KEYS) do
+            local v = ac.hwid_data[k]
+            if type(v) == "string" and v ~= "" then return v end
+        end
+        for k, v in pairs(ac.hwid_data) do
+            if type(k) == "string" and k:sub(1, 1) ~= "_"
+                    and type(v) == "string" and v ~= "" then
+                return v
+            end
+        end
+    end
+    -- 兜底: beam_id 本身就是 HWID:xxx 的情况
+    local mk, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
+    if mk and type(beam_id) == "string" then
+        return beam_id:match("^HWID:[^:]+:(.+)$") or beam_id:match("^HWID:(.+)$") or ""
+    end
+    return ""
+end
 
 -- Bridge 是否上报过机器码
 local function hasStableHwid(playerID)
@@ -1885,6 +1925,8 @@ function onInit()
             -- Client HWID plugin events
             MP.RegisterEvent("BMPHWID:HWIDReply", "onHwidReply")
             MP.RegisterEvent("BMPHWID:Version", "onHwidVersion")
+            -- 实时地图: 客户端每秒推一次坐标
+            MP.RegisterEvent("BMPHWID:Pos", "onHwidPos")
 
             -- ============================================================
             -- Chat queue timer (Bridge GUI → HTTP API → 文件 → 1Hz 轮询 → 公屏广播)
@@ -2200,6 +2242,7 @@ function onPlayerDisconnect(playerID)
     playerAuthCache[playerID] = nil
     playerVehicleCount[playerID] = nil
     pendingHwidRequests[playerID] = nil
+    playerPositions[playerID] = nil
 
     _saveOnlinePlayers()
     
@@ -2211,9 +2254,29 @@ end
 -- Online Players JSON (供 Admin GUI 读取)
 -- ============================================================
 function _saveOnlinePlayers()
+    local now = os.time()
     local list = Array({})
     for pid, data in pairs(onlinePlayers) do
         if type(data) == "table" then
+            -- 实时地图 / 网页面板需要的附加字段 (onPlayerConnected 里不一定有)
+            data.trusted = isPlayerAuthenticated(pid) and true or false
+            data.is_admin = isPlayerAdmin(pid) and true or false
+            data.beammp_id = getPlayerBeammpId(pid) or ""
+
+            -- 机器码: 直接读 hwid_data (官方账号登录时 beam_id 被 BEAMMP: 前缀占住了)
+            data.hwid = getPlayerHwid(pid)
+
+            local pos = playerPositions[pid]
+            if pos and (now - (pos.ts or 0)) <= POS_STALE_SECONDS then
+                data.pos = {
+                    x = pos.x, y = pos.y, z = pos.z,
+                    h = pos.h, map = pos.map or "",
+                    ts = pos.ts,
+                }
+            else
+                data.pos = nil
+            end
+
             table.insert(list, data)
         end
     end
@@ -2226,6 +2289,33 @@ function _saveOnlinePlayers()
         end
     else
         logWarn("_saveOnlinePlayers: jsonEncode failed: " .. tostring(encoded))
+    end
+end
+
+-- ============================================================
+-- 客户端位置上报 (BMPHWID:Pos)
+--   payload: "x,y,z,heading,mapname"
+--   服务端拿不到坐标, 全靠客户端每秒推一次
+-- ============================================================
+function onHwidPos(playerID, data)
+    if not playerID or type(data) ~= "string" or data == "" then return end
+    local parts = {}
+    for p in data:gmatch("([^,]+)") do parts[#parts + 1] = p end
+    if #parts < 3 then return end
+    local x = tonumber(parts[1])
+    local y = tonumber(parts[2])
+    local z = tonumber(parts[3])
+    if not x or not y or not z then return end
+    playerPositions[playerID] = {
+        x = x, y = y, z = z,
+        h = tonumber(parts[4]) or 0,
+        map = (parts[5] or ""):gsub("%s+$", ""),
+        ts = os.time(),
+    }
+    -- 玩家发坐标时顺手刷新一次在线列表, 保证网页上的点不会等到 3 秒定时器
+    if onlinePlayers[playerID] then
+        local p = playerPositions[playerID]
+        onlinePlayers[playerID].pos = { x = p.x, y = p.y, z = p.z, h = p.h, map = p.map, ts = p.ts }
     end
 end
 
@@ -2533,23 +2623,9 @@ function onVehicleSpawn(playerID, vehicleID, vehicleData)
     local authLabel = getPlayerAuthLabel(playerID)
     local limit = getPlayerVehicleLimit(playerID)
 
-    -- 未认证玩家: 禁止刷车
-    if role == "游客" or not isAuth then
-        local msg
-        if ENABLE_CHAT_LOGIN then
-            msg = " 您尚未登录, 无法生成车辆. 请先 /login <账号> <密码> 登录账号后即可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆"
-        else
-            -- 官方账号模式: 告诉玩家到底缺哪一步
-            local missing = {}
-            if not hasOfficialAccount(playerID) then missing[#missing + 1] = "在 BeamMP 登录官方账号" end
-            if not hasStableHwid(playerID) then missing[#missing + 1] = "启动 BMPHWID_Bridge.exe 上报机器码" end
-            if #missing == 0 then missing[#missing + 1] = "稍等几秒, 机器码正在验证" end
-            msg = " 你还没有通过认证, 暂时不能生成车辆. 还需要: " .. table.concat(missing, " + ")
-        end
-        MP.SendChatMessage(playerID, msg)
-        logDebug("onVehicleSpawn 拦截游客 #" .. tostring(playerID))
-        return 1
-    end
+    -- 未授信玩家不再"一律禁止", 而是按 VEHICLE_LIMITS.unauthenticated (=1) 限制:
+    -- 让没认证的人也能开一辆车, 想多刷就得去认证。
+    -- (以前这里直接 return 1, 导致下面的数量限制对游客根本没生效)
 
     -- 当前已生成车辆数 +1 (即将生成)
     playerVehicleCount[playerID] = (playerVehicleCount[playerID] or 0) + 1
@@ -2558,10 +2634,35 @@ function onVehicleSpawn(playerID, vehicleID, vehicleData)
     -- 超过限制: 取消生成
     if count > limit then
         playerVehicleCount[playerID] = count - 1  -- 回退计数 (车辆被取消)
-        local msg = " 您是[" .. authLabel .. "用户], 车辆上限 " .. limit .. " 辆, 已达上限, 生成被取消"
+        local msg
+        if authLabel ~= "认证" then
+            -- 未授信: 说清楚"上限是 1, 认证后 5", 而不是只说已达上限
+            msg = " 未授信用户只能生成 " .. limit .. " 辆车. "
+            if ENABLE_CHAT_LOGIN then
+                msg = msg .. "登录账号后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+            else
+                local missing = {}
+                if not hasOfficialAccount(playerID) then missing[#missing + 1] = "在 BeamMP 登录官方账号" end
+                if not hasStableHwid(playerID) then missing[#missing + 1] = "启动 BMPHWID_Bridge.exe 上报机器码" end
+                if #missing == 0 then
+                    msg = msg .. "认证后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+                else
+                    msg = msg .. "认证后上限 " .. VEHICLE_LIMITS.authenticated
+                        .. " 辆. 还需要: " .. table.concat(missing, " + ")
+                end
+            end
+        else
+            msg = " 您是[" .. authLabel .. "用户], 车辆上限 " .. limit .. " 辆, 已达上限, 生成被取消"
+        end
         MP.SendChatMessage(playerID, msg)
         logDebug("onVehicleSpawn 取消 #" .. tostring(playerID) .. " 现有 " .. (count - 1) .. "/" .. limit)
         return 1  -- 取消事件 (车辆不会生成)
+    end
+
+    -- 未认证玩家第一次生成: 提示一次, 让他知道有更高级别
+    if authLabel ~= "认证" and count == 1 then
+        MP.SendChatMessage(playerID, " 你是未授信用户, 只能生成 " .. limit
+            .. " 辆车. 完成认证后可生成 " .. VEHICLE_LIMITS.authenticated .. " 辆 (输入 /whoami 查看)")
     end
 
     -- 在限制内: 通过, 记日志

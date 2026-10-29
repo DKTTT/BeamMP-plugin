@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BeamMP 实时地图</title>
+<style>
+  :root{
+    --bg:#0b1220; --panel:#111a2b; --panel2:#16213a; --line:#22304a;
+    --txt:#e2e8f0; --muted:#94a3b8; --green:#22c55e; --gold:#fbbf24;
+    --gray:#94a3b8; --red:#ef4444; --blue:#3b82f6;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--txt);
+    font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  header{
+    display:flex; align-items:center; gap:14px;
+    padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex:0 0 auto;
+  }
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--gray);display:inline-block}
+  .dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.bad{background:var(--red)}
+  .stat{font-size:12px;color:var(--muted)}
+  .stat b{color:var(--txt);font-weight:600}
+  .spacer{flex:1}
+  button,label.btn{
+    background:var(--panel2); color:var(--txt); border:1px solid var(--line);
+    border-radius:6px; padding:5px 10px; font-size:12px; cursor:pointer;
+    font-family:inherit;
+  }
+  button:hover,label.btn:hover{border-color:var(--blue)}
+  button.on{border-color:var(--blue);color:#93c5fd}
+  #wrap{flex:1;display:flex;min-height:0}
+  #mapbox{position:relative;flex:1;min-width:0;background:#080d17}
+  #map{display:block;width:100%;height:100%;cursor:grab}
+  #map.drag{cursor:grabbing}
+  #hint{
+    position:absolute; left:12px; bottom:10px; font-size:11px; color:#64748b;
+    background:rgba(8,13,23,.75); padding:4px 8px; border-radius:6px; pointer-events:none;
+  }
+  #cal{
+    position:absolute; right:12px; top:12px; display:none; gap:6px; align-items:center;
+    background:rgba(17,26,43,.96); border:1px solid var(--line); border-radius:8px;
+    padding:8px 10px; font-size:11px; color:var(--muted); flex-wrap:wrap; max-width:340px;
+  }
+  #cal.show{display:flex}
+  #cal input{width:82px;background:#0b1220;border:1px solid var(--line);color:var(--txt);
+    border-radius:4px;padding:3px 5px;font-size:11px}
+  aside{
+    flex:0 0 340px; background:var(--panel); border-left:1px solid var(--line);
+    display:flex; flex-direction:column; min-height:0;
+  }
+  aside h2{
+    font-size:12px; margin:0; padding:10px 12px; color:var(--muted);
+    border-bottom:1px solid var(--line); font-weight:600;
+  }
+  #list{overflow-y:auto; flex:1}
+  .row{padding:8px 12px; border-bottom:1px solid #1a2537; cursor:pointer}
+  .row:hover{background:#152036}
+  .row.sel{background:#1b2b47}
+  .row .l1{display:flex;align-items:center;gap:6px;font-size:13px}
+  .row .nm{font-weight:600; overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+  .badge{font-size:10px;padding:1px 6px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+  .b-adm{color:#fde68a;border-color:#a16207;background:#3b2d06}
+  .b-trust{color:#bbf7d0;border-color:#15803d;background:#052e16}
+  .b-untrust{color:#cbd5e1;border-color:#475569;background:#1e293b}
+  .row .l2{font-size:11px;color:var(--muted);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+  .hwid{font-family:Consolas,monospace;font-size:10px;color:#7dd3fc;cursor:copy}
+  .empty{padding:24px 12px;color:#64748b;font-size:12px;text-align:center;line-height:1.7}
+  footer{
+    flex:0 0 auto; padding:6px 16px; background:var(--panel); border-top:1px solid var(--line);
+    font-size:11px; color:#64748b; display:flex; gap:16px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🗺 BeamMP 实时地图</h1>
+  <span class="dot" id="dot"></span>
+  <span class="stat">在线 <b id="cnt">-</b></span>
+  <span class="stat">地图 <b id="mapname">-</b></span>
+  <span class="stat" id="posinfo"></span>
+  <span class="spacer"></span>
+  <button id="btn-fit" class="on">自动适配</button>
+  <label class="btn">载入地图底图<input type="file" id="bgfile" accept="image/*" hidden></label>
+  <button id="btn-cal">校准</button>
+  <button id="btn-clear">清除底图</button>
+</header>
+
+<div id="wrap">
+  <div id="mapbox">
+    <canvas id="map"></canvas>
+    <div id="hint">滚轮缩放 · 拖动平移 · 点击右侧玩家定位</div>
+    <div id="cal">
+      <span>世界坐标范围:</span>
+      <input id="c1" placeholder="minX"><input id="c2" placeholder="maxX">
+      <input id="c3" placeholder="minZ"><input id="c4" placeholder="maxZ">
+      <button id="cal-save">保存</button>
+    </div>
+  </div>
+
+  <aside>
+    <h2>在线玩家 <span id="cnt2" style="color:#475569"></span></h2>
+    <div id="list"><div class="empty">正在连接服务器…</div></div>
+  </aside>
+</div>
+
+<footer>
+  <span>数据源: <code id="api"></code></span>
+  <span>每 1 秒刷新</span>
+  <span id="last">—</span>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var API = "/api/players/live";
+  var POLL_MS = 1000;
+  var LS_BG = "bmp.panel.bg";
+  var LS_CAL = "bmp.panel.cal";
+
+  var S = {
+    players: [],
+    map: "",
+    ok: false,
+    view: null,          // {x0, z0, scale}
+    autoFit: true,
+    sel: null,
+    bg: null,            // Image
+    cal: null,           // {minX,maxX,minZ,maxZ}
+    drag: null
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var cv = $("map"), ctx = cv.getContext("2d");
+  var box = $("mapbox");
+
+  /* ---------------- 尺寸 ---------------- */
+  function resize() {
+    var r = box.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = Math.max(1, Math.round(r.width * dpr));
+    cv.height = Math.max(1, Math.round(r.height * dpr));
+    cv.style.width = r.width + "px";
+    cv.style.height = r.height + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+  window.addEventListener("resize", resize);
+
+  /* ---------------- 视图 ---------------- */
+  function bboxOf(players) {
+    var minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, n = 0;
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i].pos;
+      if (!p || typeof p.x !== "number" || typeof p.z !== "number") continue;
+      n++;
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.z < minZ) minZ = p.z;
+      if (p.z > maxZ) maxZ = p.z;
+    }
+    if (!n) return null;
+    return { minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ };
+  }
+
+  function fitTo(b) {
+    var W = box.clientWidth, H = box.clientHeight;
+    var dx = Math.max(b.maxX - b.minX, 1);
+    var dz = Math.max(b.maxZ - b.minZ, 1);
+    // 给点留边距
+    dx *= 1.25; dz *= 1.25;
+    var scale = Math.min(W / dx, H / dz);
+    if (!isFinite(scale) || scale <= 0) scale = 1;
+    var cx = (b.minX + b.maxX) / 2, cz = (b.minZ + b.maxZ) / 2;
+    S.view = {
+      scale: scale,
+      x0: cx - (W / scale) / 2,
+      z0: cz - (H / scale) / 2
+    };
+  }
+
+  function w2s(x, z) {
+    var v = S.view;
+    return { sx: (x - v.x0) * v.scale, sy: (z - v.z0) * v.scale };
+  }
+
+  /* ---------------- 绘制 ---------------- */
+  function draw() {
+    var W = box.clientWidth, H = box.clientHeight;
+    ctx.clearRect(0, 0, W, H);
+
+    // 底图 (可选)
+    if (S.bg && S.cal) {
+      var a = w2s(S.cal.minX, S.cal.minZ);
+      var b = w2s(S.cal.maxX, S.cal.maxZ);
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.drawImage(S.bg, a.sx, a.sy, b.sx - a.sx, b.sy - a.sy);
+      ctx.restore();
+    }
+
+    if (!S.view) {
+      ctx.fillStyle = "#64748b";
+      ctx.font = "13px 'Microsoft YaHei UI',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("等待玩家位置… (需要客户端 BMPHWID mod 上报)", W / 2, H / 2);
+      return;
+    }
+
+    drawGrid(W, H);
+
+    // 玩家
+    for (var i = 0; i < S.players.length; i++) {
+      var pl = S.players[i];
+      if (!pl.pos) continue;
+      var s = w2s(pl.pos.x, pl.pos.z);
+      var col = pl.is_admin ? "#fbbf24" : (pl.trusted ? "#22c55e" : "#94a3b8");
+      var isSel = (S.sel === pl.playerID);
+      var r = isSel ? 8 : 6;
+
+      // 朝向小三角
+      var ang = (pl.pos.h || 0) * Math.PI / 180;
+      ctx.save();
+      ctx.translate(s.sx, s.sy);
+      ctx.rotate(ang);
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 1.6);
+      ctx.lineTo(r, r);
+      ctx.lineTo(-r, r);
+      ctx.closePath();
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.95;
+      ctx.fill();
+      ctx.restore();
+
+      if (isSel) {
+        ctx.beginPath();
+        ctx.arc(s.sx, s.sy, r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = "#3b82f6";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "11px 'Microsoft YaHei UI',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(pl.name || ("#" + pl.playerID), s.sx, s.sy - r - 10);
+    }
+  }
+
+  function drawGrid(W, H) {
+    // 根据缩放挑一个合适的网格间距
+    var target = 80; // 屏幕上大概每 80px 一条
+    var raw = target / S.view.scale;
+    var pow = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10));
+    var steps = [1, 2, 5, 10];
+    var step = pow;
+    for (var i = 0; i < steps.length; i++) {
+      if (pow * steps[i] >= raw) { step = pow * steps[i]; break; }
+    }
+    var v = S.view;
+    var xStart = Math.floor(v.x0 / step) * step;
+    var zStart = Math.floor(v.z0 / step) * step;
+    var xEnd = v.x0 + W / v.scale;
+    var zEnd = v.z0 + H / v.scale;
+
+    ctx.strokeStyle = "rgba(59,130,246,.12)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var x = xStart; x < xEnd + step; x += step) {
+      var p = w2s(x, 0).sx;
+      ctx.moveTo(p, 0); ctx.lineTo(p, H);
+    }
+    for (var z = zStart; z < zEnd + step; z += step) {
+      var q = w2s(0, z).sy;
+      ctx.moveTo(0, q); ctx.lineTo(W, q);
+    }
+    ctx.stroke();
+  }
+
+  /* ---------------- 交互 ---------------- */
+  cv.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    if (!S.view) return;
+    var r = cv.getBoundingClientRect();
+    var mx = e.clientX - r.left, my = e.clientY - r.top;
+    var k = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    var wx = S.view.x0 + mx / S.view.scale;
+    var wz = S.view.z0 + my / S.view.scale;
+    S.view.scale *= k;
+    S.view.x0 = wx - mx / S.view.scale;
+    S.view.z0 = wz - my / S.view.scale;
+    S.autoFit = false;
+    $("btn-fit").classList.remove("on");
+    draw();
+  }, { passive: false });
+
+  cv.addEventListener("mousedown", function (e) {
+    if (!S.view) return;
+    S.drag = { x: e.clientX, y: e.clientY, x0: S.view.x0, z0: S.view.z0 };
+    cv.classList.add("drag");
+  });
+  window.addEventListener("mousemove", function (e) {
+    if (!S.drag) return;
+    var dx = e.clientX - S.drag.x, dy = e.clientY - S.drag.y;
+    S.view.x0 = S.drag.x0 - dx / S.view.scale;
+    S.view.z0 = S.drag.z0 - dy / S.view.scale;
+    S.autoFit = false;
+    $("btn-fit").classList.remove("on");
+    draw();
+  });
+  window.addEventListener("mouseup", function () {
+    S.drag = null;
+    cv.classList.remove("drag");
+  });
+
+  $("btn-fit").addEventListener("click", function () {
+    S.autoFit = true;
+    this.classList.add("on");
+    var b = bboxOf(S.players);
+    if (b) { fitTo(b); draw(); }
+  });
+
+  /* ---------------- 底图 + 校准 ---------------- */
+  function loadCal() {
+    try {
+      var v = JSON.parse(localStorage.getItem(LS_CAL) || "null");
+      if (v && typeof v.minX === "number") {
+        S.cal = v;
+        $("c1").value = v.minX; $("c2").value = v.maxX;
+        $("c3").value = v.minZ; $("c4").value = v.maxZ;
+      }
+    } catch (e) {}
+  }
+  function loadBg() {
+    var data = localStorage.getItem(LS_BG);
+    if (!data) return;
+    var img = new Image();
+    img.onload = function () { S.bg = img; draw(); };
+    img.src = data;
+  }
+  $("bgfile").addEventListener("change", function (e) {
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    var fr = new FileReader();
+    fr.onload = function () {
+      try { localStorage.setItem(LS_BG, fr.result); } catch (err) {
+        alert("图片太大, 浏览器存不下 (换小一点的图)");
+      }
+      var img = new Image();
+      img.onload = function () { S.bg = img; $("cal").classList.add("show"); draw(); };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(f);
+  });
+  $("btn-cal").addEventListener("click", function () {
+    $("cal").classList.toggle("show");
+  });
+  $("cal-save").addEventListener("click", function () {
+    var v = {
+      minX: parseFloat($("c1").value), maxX: parseFloat($("c2").value),
+      minZ: parseFloat($("c3").value), maxZ: parseFloat($("c4").value)
+    };
+    if (!isFinite(v.minX) || !isFinite(v.maxX) || !isFinite(v.minZ) || !isFinite(v.maxZ)
+        || v.maxX <= v.minX || v.maxZ <= v.minZ) {
+      alert("范围要填成 minX < maxX, minZ < maxZ");
+      return;
+    }
+    S.cal = v;
+    localStorage.setItem(LS_CAL, JSON.stringify(v));
+    S.autoFit = false;
+    $("btn-fit").classList.remove("on");
+    fitTo(v);
+    draw();
+  });
+  $("btn-clear").addEventListener("click", function () {
+    localStorage.removeItem(LS_BG);
+    localStorage.removeItem(LS_CAL);
+    S.bg = null; S.cal = null;
+    draw();
+  });
+
+  /* ---------------- 列表 ---------------- */
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function renderList() {
+    var el = $("list");
+    if (!S.players.length) {
+      el.innerHTML = '<div class="empty">当前没有在线玩家<br>（或 Lua 插件还没写出 online_players.json）</div>';
+      return;
+    }
+    var html = "";
+    for (var i = 0; i < S.players.length; i++) {
+      var p = S.players[i];
+      var badges = "";
+      if (p.is_admin) badges += '<span class="badge b-adm">管理员</span>';
+      badges += p.trusted
+        ? '<span class="badge b-trust">授信用户</span>'
+        : '<span class="badge b-untrust">未授信</span>';
+      var hwid = p.hwid ? '<span class="hwid" data-hw="' + esc(p.hwid) + '">' + esc(p.hwid) + "</span>" : '<span style="color:#475569">无机器码</span>';
+      var acc = p.beammp_id ? esc(p.beammp_id.slice(0, 12) + "…") : "未登录";
+      var mins = Math.floor((p.online_seconds || 0) / 60);
+      html += '<div class="row' + (S.sel === p.playerID ? " sel" : "") + '" data-pid="' + esc(p.playerID) + '">'
+        + '<div class="l1"><span class="nm">' + esc(p.name) + "</span>" + badges + "</div>"
+        + '<div class="l2"><span>官方账号 ' + acc + "</span><span>车辆 " + (p.vehicle_count || 0) + "</span><span>" + mins + " 分钟</span></div>"
+        + '<div class="l2">机器码 ' + hwid + "</div>"
+        + "</div>";
+    }
+    el.innerHTML = html;
+
+    var rows = el.querySelectorAll(".row");
+    for (var j = 0; j < rows.length; j++) {
+      rows[j].addEventListener("click", function () {
+        var pid = this.getAttribute("data-pid");
+        S.sel = (S.sel === pid) ? null : pid;
+        renderList();
+        centerOnSelected();
+        draw();
+      });
+    }
+    var hws = el.querySelectorAll(".hwid");
+    for (var k = 0; k < hws.length; k++) {
+      hws[k].addEventListener("click", function (e) {
+        e.stopPropagation();
+        var v = this.getAttribute("data-hw");
+        navigator.clipboard && navigator.clipboard.writeText(v);
+        var old = this.textContent;
+        this.textContent = "已复制 ✓";
+        var self = this;
+        setTimeout(function () { self.textContent = old; }, 900);
+      });
+    }
+  }
+
+  function centerOnSelected() {
+    if (!S.sel || !S.view) return;
+    for (var i = 0; i < S.players.length; i++) {
+      var p = S.players[i];
+      if (p.playerID === S.sel && p.pos) {
+        S.view.x0 = p.pos.x - (box.clientWidth / S.view.scale) / 2;
+        S.view.z0 = p.pos.z - (box.clientHeight / S.view.scale) / 2;
+        S.autoFit = false;
+        $("btn-fit").classList.remove("on");
+        return;
+      }
+    }
+  }
+
+  /* ---------------- 轮询 ---------------- */
+  function setStatus(ok) {
+    S.ok = ok;
+    var d = $("dot");
+    d.className = "dot " + (ok ? "ok" : "bad");
+  }
+
+  function poll() {
+    fetch(API, { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.ok) throw new Error("bad payload");
+        var d = j.data || {};
+        S.players = d.players || [];
+        S.map = d.map || "";
+        setStatus(true);
+        $("cnt").textContent = d.count != null ? d.count : S.players.length;
+        $("cnt2").textContent = "(" + (S.players.length) + ")";
+        $("mapname").textContent = S.map || "未知";
+        var withPos = S.players.filter(function (p) { return p.pos; }).length;
+        $("posinfo").textContent = "有坐标 " + withPos + "/" + S.players.length;
+        $("last").textContent = "最后更新 " + new Date().toLocaleTimeString();
+
+        if (S.autoFit) {
+          var b = bboxOf(S.players);
+          if (b) fitTo(b);
+        }
+        renderList();
+        draw();
+      })
+      .catch(function () {
+        setStatus(false);
+        $("last").textContent = "连接失败, 重试中…";
+      });
+  }
+
+  /* ---------------- 启动 ---------------- */
+  $("api").textContent = API;
+  loadCal();
+  loadBg();
+  resize();
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

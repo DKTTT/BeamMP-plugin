@@ -2,8 +2,8 @@
     "Name": "BMPHWID",
     "Author": "BMP Login Plugin",
     "Type": "script",
-    "Version": "2.7.0",
-    "Description": "v2.7.0: 修复 HWID 上报协议 (服务器从未真正收到字段) + 异步 HTTP (不再卡主线程 3 秒) + UUID 熵修复 + 兼容旧版服务端格式",
+    "Version": "2.8.0",
+    "Description": "v2.8.0: 新增实时地图坐标上报 (BMPHWID:Pos) + 修复 HWID 上报协议 + 异步 HTTP",
     "DefaultEnabled": true,
     "Visibility": "PRIVATE"
 }

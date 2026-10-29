@@ -38,8 +38,9 @@ BeamMP 官方账号服务器恢复后，**本插件自带的"聊天框注册/登
 | 官方账号已登录 | 在 BeamMP 启动器里登录自己的账号（游客身份不算） | `官方账号: 已登录 ✓` |
 | 机器码已上报 | 开着 `BMPHWID_Bridge.exe`（客户端 mod 会主动拉取并上报） | `机器码: 已上报 ✓` |
 
-两个都满足 = 认证用户（5 辆车）；缺任意一个 = 未认证（0 辆，不能刷车）。
+两个都满足 = **授信用户**（5 辆车）；缺任意一个 = **未授信**（1 辆，能开但刷不了）。
 管理员不看这两个条件，只认 `main.lua` 里的 `ADMIN_BEAMMP_IDS` 白名单（999 辆）。
+这些状态在网页面板（`http://<IP>:12124/`）上能看到。
 
 **怎么把自己设成管理员：**
 
@@ -151,10 +152,60 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 | 角色 | 车辆上限 | 获得方式 |
 |---|---|---|
 | 管理员 | 999 | 官方账号 ID 在 `main.lua` 的 `ADMIN_BEAMMP_IDS` 白名单里 |
-| 已认证玩家 | 5 | BeamMP 官方账号已登录 **且** 机器码已上报 |
-| 未认证游客 | 0 | 缺任意一个条件 (禁止刷车) |
+| 授信用户 | 5 | BeamMP 官方账号已登录 **且** 机器码已上报 |
+| 未授信 | 1 | 缺任意一个条件 (能开一辆, 想多刷就得认证) |
 
-> 旧账号模式 (`ENABLE_CHAT_LOGIN = true`) 下仍然是: 管理员 999 / 已登录账号 5 / 游客 0。
+> 旧账号模式 (`ENABLE_CHAT_LOGIN = true`) 下: 管理员 999 / 已登录账号 5 / 游客 1。
+
+---
+
+## 🗺 网页面板 (实时地图)
+
+浏览器直接打开 **`http://<服务器IP>:12124/`** 就是面板，不需要另外起 web 服务。
+
+面板分两栏：
+
+- **左边实时地图**：每个在线玩家一个箭头（箭头方向 = 车头朝向），
+  颜色区分 `管理员`(金) / `授信用户`(绿) / `未授信`(灰)。
+  滚轮缩放、拖动平移、"自动适配"把所有玩家框进视野。
+- **右边玩家列表**：名字 + 徽章 + 官方账号ID + **机器码**（点一下复制）+ 车辆数 + 在线时长。
+
+### 坐标是怎么来的
+
+BeamMP **服务端 Lua 拿不到玩家坐标**，所以是客户端 mod 每秒推一次：
+
+```
+BMPHWID mod (客户端)  --TriggerServerEvent("BMPHWID:Pos")-->  main.lua onHwidPos()
+                                                              ↓
+                                                    online_players.json
+                                                              ↓
+                         BMP_HTTP_API /api/players/live  ->  面板每 1 秒拉一次
+```
+
+因此：**玩家必须装新版 `BMPHWID.zip`（v2.8.0+）**，地图上才会有他的点；
+老 zip 只会显示在右侧列表里（没有坐标）。超过 10 秒没更新，点会自动消失。
+
+### 底图 / 校准（可选）
+
+面板默认只画坐标网格。想叠真实地图：
+
+1. 点右上角「载入地图底图」，选一张该地图的俯视图（png/jpg）
+2. 点「校准」，填这张图对应的**世界坐标范围** `minX / maxX / minZ / maxZ`
+3. 保存 —— 存在浏览器 localStorage，下次打开还在
+
+> 校准值每张地图不同，需要自己量一次。游戏里 `/whoami` 看不到坐标，
+> 可以临时看面板上的网格读数，或者用 `Ctrl+Shift+F` 之类的调试手段取点。
+> 不校准也能用，只是没有底图。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | 网页面板 (panel.html) |
+| GET | `/api/players/live` | 面板数据：`count` / `players[]` / `map`，含 `pos`、`hwid`、`trusted` |
+| GET | `/api/ping` | 健康检查 (JSON) |
+
+> `panel.html` 必须和 `BMP_HTTP_API.py` **放在同一目录**，否则 `/` 会返回 404 并提示。
 
 ---
 
@@ -186,14 +237,17 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 ```
 BeamMP-plugin/
 ├── BMP_HTTP_API.py              # 服务器 HTTP API 后端
+├── panel.html                   # 网页面板 (实时地图) —— 必须和 API 同目录
 ├── BMPHWID_Bridge.py            # 玩家认证器源码
 ├── BMP_Admin.py                 # 管理员后台源码
 ├── Resources/Server/BMPLogin/main.lua  # BeamMP 服务端 Lua 插件
+├── Resources/Client/BMPHWID.zip # 客户端 mod (坐标上报 + 机器码上报)
 ├── bmp_login/
 │   ├── accounts.json            # 账号数据 (密码 hash)
 │   ├── guestmap.json            # HWID → 账号映射
 │   ├── banlist.json             # 封禁列表
 │   ├── chat_queue.json          # 待广播聊天队列
+│   ├── online_players.json      # 在线玩家 + 坐标 (网页面板读它)
 │   └── admin_audit.jsonl        # 管理员操作审计日志
 ├── dist/
 │   ├── BMPHWID_Bridge.exe       # 玩家认证器打包
@@ -234,6 +288,27 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 ---
 
 ## 📋 变更日志
+
+### v3.4.0 (2026-10-29) — 实时地图网页面板 + 未授信 1 辆车
+
+- 🗺 **新增 `panel.html` 网页面板**：浏览器打开 `http://<IP>:12124/` 就能用
+  - 实时地图：玩家箭头（朝向 = 车头方向）、管理员/授信/未授信 三色、
+    滚轮缩放 / 拖拽平移 / 自动适配
+  - 玩家列表：名字、徽章、官方账号ID、**机器码（点击复制）**、车辆数、在线时长
+  - 可选底图：载入地图俯视图 + 填世界坐标范围做校准，存 localStorage
+- 📡 **客户端 mod v2.8.0 增加坐标上报**：BeamMP 服务端 Lua 拿不到玩家坐标，
+  所以由客户端每秒 `TriggerServerEvent("BMPHWID:Pos", "x,y,z,heading,map")`，
+  服务端 `onHwidPos()` 收下后写进 `online_players.json`（超过 10 秒没更新就当作失效）。
+- 🔌 新增 `GET /api/players/live`（面板数据源）和 `GET /`（返回 panel.html）；
+  `GET /api/ping` 保持原样。
+- 🐞 **机器码显示为空**：原来是从 `beam_id` 里截 HWID，但官方账号登录时
+  `getPlayerStableInfo` 的 P0 会把 `beam_id` 固定成 `BEAMMP:xxx`，机器码根本不在里面。
+  改为直接读 `playerAuthCache.hwid_data`（带优先级 key 和兜底）。
+- ⚙️ **未授信刷车数量 0 → 1**：`VEHICLE_LIMITS.unauthenticated = 1`。
+  同时修掉一个隐藏问题：`onVehicleSpawn` 里对游客是**无条件 `return 1`** 的，
+  导致下面的数量限制对未认证玩家从来没生效过。现在统一走数量判定，
+  未授信第一次生成会提示"你是未授信用户，只能生成 1 辆，认证后 5 辆 (/whoami)"，
+  第二次才拦。
 
 ### v3.3.0 (2026-10-29) — 切换为 "BeamMP 官方账号 + 机器码" 认证
 

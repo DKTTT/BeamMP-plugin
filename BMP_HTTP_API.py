@@ -68,7 +68,7 @@ _set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.2.0"
+VERSION = "BMP-HTTP/v1.3.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -490,10 +490,15 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "IP not allowed"})
             return
         path = urlparse(self.path).path.rstrip("/") or "/"
-        if path in ("/", "/api/ping"):
+        if path == "/api/ping":
             self._json(200, {"ok": True, "ver": VERSION,
                              "now": int(time.time())})
             return
+        # 网页面板: 浏览器直接打开 http://<服务器IP>:12124/
+        if path in ("/", "/index.html", "/panel"):
+            return self._serve_panel()
+        if path == "/api/players/live":
+            return self._players_live(getattr(self, "_auth_cache", None))
         if path == "/api/chat/queue":
             return self._chat_queue(getattr(self, "_auth_cache", None))
         if path == "/api/players/names":
@@ -1226,8 +1231,85 @@ class APIHandler(BaseHTTPRequestHandler):
             data = []
         return self._json(200, {"ok": True, "data": data})
 
+    # ============= 网页面板 =============
+    def _serve_panel(self):
+        """把 panel.html 原样返回 (与 BMP_HTTP_API.py 放在同一目录)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(here, "panel.html")
+        try:
+            with open(p, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._json(404, {"ok": False,
+                             "error": "找不到 panel.html, 请把它和 BMP_HTTP_API.py 放在同一目录"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _players_live(self, auth):
+        """实时地图 / 网页面板的数据源: 直接读 Lua 写的 online_players.json.
+
+        Lua 每 3 秒 (以及每次收到坐标时) 刷新这个文件; 每个玩家条目里:
+          pos      = {x,y,z,h,map,ts}  客户端每秒推上来的坐标
+          hwid     = 机器码 (从 BeamID 里截出来的 UUID)
+          trusted  = 是否授信用户
+        """
+        try:
+            with FILE_LOCK:
+                raw = readJsonFile(ONLINE_FILE)
+        except Exception:
+            raw = None
+        if not isinstance(raw, list):
+            raw = []
+
+        players = []
+        map_name = ""
+        now = int(time.time())
+        for p in raw:
+            if not isinstance(p, dict):
+                continue
+            pos = p.get("pos") if isinstance(p.get("pos"), dict) else None
+            if pos:
+                m = pos.get("map") or ""
+                if m and not map_name:
+                    map_name = m
+            players.append({
+                "playerID": p.get("playerID"),
+                "name": p.get("name", ""),
+                "role": p.get("role", ""),
+                "is_authenticated": bool(p.get("is_authenticated")),
+                "trusted": bool(p.get("trusted", p.get("is_authenticated"))),
+                "is_admin": bool(p.get("is_admin")),
+                "beammp_id": p.get("beammp_id", ""),
+                "bind_account": p.get("bind_account", ""),
+                "hwid": p.get("hwid", ""),
+                "vehicle_count": p.get("vehicle_count", 0),
+                "join_time": p.get("join_time", 0),
+                "online_seconds": max(0, now - int(p.get("join_time") or now)),
+                "pos": None if not pos else {
+                    "x": pos.get("x"), "y": pos.get("y"), "z": pos.get("z"),
+                    "h": pos.get("h", 0), "map": pos.get("map", ""),
+                    "age": max(0, now - int(pos.get("ts") or now)),
+                },
+            })
+
+        return self._json(200, {
+            "ok": True,
+            "data": {
+                "count": len(players),
+                "players": players,
+                "map": map_name,
+                "server_time": now,
+                "auth_mode": "official" ,   # 仅供参考, 面板不依赖
+            },
+        })
+
     def _players_names(self):
-        """Return only online player names (public, no auth needed)"""
         try:
             with FILE_LOCK:
                 data = readJsonFile(ONLINE_FILE) or []
