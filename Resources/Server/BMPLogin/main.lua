@@ -1,11 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v3.4.0 (官方账号 + 机器码认证)
+-- BMP Login Plugin v3.7.0 (官方账号 + 机器码 + 网站验证)
 -- BeamMP Server Player Account Management
 -- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "3.5.0"
+local PLUGIN_VERSION = "3.7.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -18,30 +18,43 @@ local BINDINGS_FILE = DATA_DIR .. "/bindings.json"    -- 机器码 ↔ 官方账
 -- ============================================================
 -- 认证模式开关  ★ 部署前先看这里 ★
 --
---   BeamMP 官方账号服务器恢复后, 插件自带的"聊天框注册/登录"可以关掉,
---   改为走 **官方账号 + 机器码(HWID)**:
---     认证用户 = 官方账号已登录 (!isGuest)  **且**  Bridge 上报了机器码
+--   授信判定只看一件事: **这个机器码在服务器网站上注册过, 并且验证通过**
+--   (accounts.json 里 verified=true 且 hwid 对得上)。
+--
+--     授信用户 (5 辆) = 机器码已在本站注册且 verified
+--     其它人     (1 辆) = 没注册的, 不管是登录了官方账号还是游客
+--
+--   官方账号和机器码不再是玩的时候的前置条件, 而是**注册时的门槛**:
+--   网站只允许「服务器见过它和官方账号同时在线」的机器码注册,
+--   所以"注册过"本身就隐含了"曾经有官方账号 + 有机器码"。
+--   注册之后就算以游客身份进服, 只要机器码对得上, 照样是授信。
 --
 --   把 ENABLE_CHAT_LOGIN 改回 true 即可恢复旧的 /register /login 账号体系
 --   (accounts.json 里的老账号仍然保留, 不会被删)。
 -- ============================================================
 local ENABLE_CHAT_LOGIN = false   -- 内置聊天框注册/登录 (官方账号可用后关闭)
 
--- 认证判定: 两个开关可以单独关掉, 方便排查问题
-local REQUIRE_OFFICIAL_ACCOUNT = true   -- 必须官方账号已登录 (!isGuest)
-local REQUIRE_HWID = true               -- 必须 Bridge 上报过机器码
+-- 认证判定: 三个开关可以单独关掉, 方便排查问题
+local REQUIRE_WEB_VERIFY = true         -- ★ 必须在本站注册过且机器码验证通过 (主开关)
+local REQUIRE_HWID = false              -- 额外要求: Bridge 上报过机器码 (默认已隐含, 关)
+local REQUIRE_OFFICIAL_ACCOUNT = false  -- 额外要求: 官方账号已登录 (默认关, 游客也算授信)
+
+-- 网站账号 → 授信白名单的刷新间隔 (秒)
+--   accounts.json 可能被 BMP_HTTP_API 在运行时改写 (玩家刚注册), Lua 这边要能跟上
+local WEB_VERIFY_REFRESH = 10
 
 -- 管理员白名单: BeamMP **官方账号 ID** (onPlayerAuth 里的 identifiers.beammp)
 --   玩家在游戏里输 /whoami 就能看到自己的"官方账号ID", 复制过来填进去。
 --   注意这里不是显示名 —— 显示名可以随便改, ID 改不了, 不会被冒充。
+--   (管理员走的是官方账号, 不依赖网站注册; 这样万一网站挂了你还进得去后台)
 local ADMIN_BEAMMP_IDS = {
     -- ["0123456789abcdef0123456789abcdef"] = true,
 }
 
 -- 聊天登录关闭后, 玩家输 /register /login 时给的提示 (所有命令复用同一句)
 local CHAT_LOGIN_OFF_MSG =
-    "内置账号登录已关闭, 现在使用 BeamMP 官方账号 + 机器码认证. "
-    .. "请在 BeamMP 里登录官方账号, 并启动 BMPHWID_Bridge.exe 上报机器码, 然后用 /whoami 查看状态"
+    "内置账号登录已关闭。授信只要一步: 打开服务器网站注册 (用机器码验证)。"
+    .. "注册前请在 BeamMP 登录官方账号并开着 BMPHWID_Bridge 进一次服。用 /whoami 查看状态"
 
 local accounts = {}
 local banlist = {}
@@ -889,6 +902,59 @@ local function hasStableHwid(playerID)
     return false
 end
 
+-- ============================================================
+-- 网站账号白名单 (授信的必要条件)
+--   只有「在本站注册过 且 机器码验证通过 (verified=true)」的机器码才算授信。
+--   accounts.json 由 BMP_HTTP_API 在运行时改写 (玩家刚注册就生效),
+--   所以这里定时重建一张 hwid -> username 的表, 而不是每个玩家都去翻文件。
+-- ============================================================
+local verifiedHwids = {}          -- "<hwid>" -> username
+local verifiedCount = 0
+local lastVerifiedRefresh = 0
+
+local function rebuildVerifiedHwids()
+    local data = readJsonFile(ACCOUNTS_FILE)
+    local map = {}
+    local n = 0
+    if type(data) == "table" then
+        for uname, acc in pairs(data) do
+            if type(acc) == "table" and acc.verified == true then
+                local h = acc.hwid
+                if type(h) == "string" and h ~= "" then
+                    map[h:lower()] = tostring(uname)
+                    n = n + 1
+                end
+            end
+        end
+    end
+    verifiedHwids = map
+    verifiedCount = n
+    lastVerifiedRefresh = os.time()
+    logDebug("verified hwid 白名单已刷新: " .. n .. " 条")
+end
+
+local function ensureVerifiedHwids()
+    local now = os.time()
+    if (now - lastVerifiedRefresh) >= WEB_VERIFY_REFRESH then
+        local ok, err = pcall(rebuildVerifiedHwids)
+        if not ok then
+            logWarn("刷新 verified 白名单失败: " .. tostring(err))
+            lastVerifiedRefresh = now      -- 别在坏文件上死循环
+        end
+    end
+end
+
+-- 这个玩家是否对应一个已验证的网站账号; 返回 (true, username) / (false, nil)
+local function getWebAccount(playerID)
+    if not playerID then return false, nil end
+    local hwid = getPlayerHwid(playerID)
+    if type(hwid) ~= "string" or hwid == "" then return false, nil end
+    ensureVerifiedHwids()
+    local uname = verifiedHwids[hwid:lower()]
+    if uname then return true, uname end
+    return false, nil
+end
+
 -- 是否登录了 BeamMP 官方账号 (onPlayerAuth 的 isGuest == false)
 local function hasOfficialAccount(playerID)
     if not playerID then return false end
@@ -904,13 +970,17 @@ end
 isPlayerAuthenticated = function(playerID)
     if not playerID then return false end
 
-    -- ---- 官方账号 + 机器码模式 ----
+    -- ---- 官方账号 + 机器码 + 网站验证 ----
     if not ENABLE_CHAT_LOGIN then
         if REQUIRE_OFFICIAL_ACCOUNT and not hasOfficialAccount(playerID) then
             return false
         end
         if REQUIRE_HWID and not hasStableHwid(playerID) then
             return false
+        end
+        if REQUIRE_WEB_VERIFY then
+            local ok = getWebAccount(playerID)
+            if not ok then return false end
         end
         return true
     end
@@ -1092,16 +1162,16 @@ end
 local function sendWelcomeGuide(playerID, playerName)
     local msg = {}
     if not ENABLE_CHAT_LOGIN then
-        msg[1] = " =========== 认证指引 ==========="
-        msg[2] = " 欢迎来到服务器！本服使用 BeamMP 官方账号 + 机器码认证"
-        msg[3] = " 1) 在 BeamMP 启动器里登录你的官方账号 (游客身份无法认证)"
-        msg[4] = " 2) 启动 BMPHWID_Bridge.exe, 它会自动上报你的机器码"
-        msg[5] = " /whoami - 查看还缺哪一步"
+        msg[1] = " =========== 授信指引 ==========="
+        msg[2] = " 欢迎来到服务器！本服靠「网站注册 + 机器码验证」给授信"
+        msg[3] = " 1) 启动 BMPHWID_Bridge.exe (它会自动上报你的机器码)"
+        msg[4] = " 2) 浏览器打开 http://<服务器IP>:12124/account ，点【读取本机】注册"
+        msg[5] = " 注册立刻生效, 不用重进; 用 /whoami 查看状态"
         msg[6] = " /vehiclelimit - 查看车辆上限"
         msg[7] = " /help - 查看所有命令"
         msg[8] = " ================================"
-        msg[9] = " [车辆限制] 未认证 0 辆, 认证 5 辆, 管理员 999 辆"
-        msg[10] = " [认证条件] 官方账号已登录 + 机器码已上报"
+        msg[9] = " [车辆限制] 未授信 1 辆, 授信 5 辆, 管理员 999 辆"
+        msg[10] = " [授信条件] 在服务器网站注册过且机器码验证通过"
     else
         msg[1] = " =========== 登录指引 ==========="
         msg[2] = " 欢迎来到服务器！请使用以下命令注册或登录："
@@ -1669,20 +1739,24 @@ function _handleChat(playerID, playerName, message)
             MP.SendChatMessage(playerID, " 身份: " .. role .. "  认证状态: " .. authLabel .. "  车辆上限: " .. limit .. " 辆")
 
             if not ENABLE_CHAT_LOGIN then
-                -- 官方账号 + 机器码模式: 逐项告诉玩家缺什么
-                local official = hasOfficialAccount(playerID)
+                -- 授信只看「机器码 + 网站注册」; 官方账号只作为附加信息显示
+                local webOk, webUser = getWebAccount(playerID)
                 local hwid = hasStableHwid(playerID)
+                local official = hasOfficialAccount(playerID)
+                MP.SendChatMessage(playerID,
+                    " 授信条件: 机器码 " .. (hwid and "✓ 已上报" or "✗ 未上报")
+                    .. "   网站注册 " .. (webOk and ("✓ " .. tostring(webUser)) or "✗ 未注册")
+                    .. "   (当前身份: " .. (official and "官方账号" or "游客") .. ")")
                 local bid = getPlayerBeammpId(playerID)
-                MP.SendChatMessage(playerID, " 官方账号: " .. (official and "已登录 ✓" or "未登录 ✗")
-                    .. "   机器码: " .. (hwid and "已上报 ✓" or "未上报 ✗"))
                 if bid then
                     MP.SendChatMessage(playerID, " 官方账号ID: " .. tostring(bid))
                 end
-                if not official then
-                    MP.SendChatMessage(playerID, " 请先在 BeamMP 里用官方账号登录再进服")
-                end
+                -- 只提示第一个没满足的, 免得一次刷屏
                 if not hwid then
-                    MP.SendChatMessage(playerID, " 请启动 BMPHWID_Bridge.exe (机器码上报后才能认证)")
+                    MP.SendChatMessage(playerID, " 请启动 BMPHWID_Bridge.exe (机器码上报后才能注册)")
+                elseif not webOk then
+                    MP.SendChatMessage(playerID, " 还需要注册: 浏览器打开 http://<服务器IP>:12124/account")
+                    MP.SendChatMessage(playerID, " 点【读取本机】自动填机器码, 注册后立刻变成授信 (5 辆)")
                 end
             end
 
@@ -1997,6 +2071,10 @@ function onInit()
     end)
     pcall(function()
         loadBindings()
+    end)
+    pcall(function()
+        rebuildVerifiedHwids()      -- 授信白名单 (accounts.json 里 verified=true 的机器码)
+        print("[BMP Login] 已注册且验证的机器码: " .. verifiedCount)
     end)
     
     -- Register all events (BeamMP v3.9.3 requires MP.RegisterEvent with 2 params)
@@ -2360,6 +2438,11 @@ function _saveOnlinePlayers()
 
             -- 机器码: 直接读 hwid_data (官方账号登录时 beam_id 被 BEAMMP: 前缀占住了)
             data.hwid = getPlayerHwid(pid)
+
+            -- 网站账号 (授信的必要条件), 网页面板会显示
+            local webOk, webUser = getWebAccount(pid)
+            data.web_verified = webOk and true or false
+            data.web_account = webUser or ""
 
             -- 位置信息: 实时地图已下线, 不再写进 JSON (playerPositions 仍在内存里,
             -- 以后要恢复地图, 把下面几行取消注释即可)
@@ -2727,12 +2810,14 @@ function onVehicleSpawn(playerID, vehicleID, vehicleData)
                 msg = msg .. "登录账号后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆"
             else
                 local missing = {}
-                if not hasOfficialAccount(playerID) then missing[#missing + 1] = "在 BeamMP 登录官方账号" end
                 if not hasStableHwid(playerID) then missing[#missing + 1] = "启动 BMPHWID_Bridge.exe 上报机器码" end
+                if not getWebAccount(playerID) then
+                    missing[#missing + 1] = "在服务器网站注册 (http://<服务器IP>:12124/account)"
+                end
                 if #missing == 0 then
-                    msg = msg .. "认证后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆"
+                    msg = msg .. "授信后上限 " .. VEHICLE_LIMITS.authenticated .. " 辆"
                 else
-                    msg = msg .. "认证后上限 " .. VEHICLE_LIMITS.authenticated
+                    msg = msg .. "授信后上限 " .. VEHICLE_LIMITS.authenticated
                         .. " 辆. 还需要: " .. table.concat(missing, " + ")
                 end
             end

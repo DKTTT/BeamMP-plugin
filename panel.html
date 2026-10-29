@@ -80,6 +80,7 @@
   .b-adm{color:#fde68a;border-color:#a16207;background:#3b2d06}
   .b-trust{color:#bbf7d0;border-color:#15803d;background:#052e16}
   .b-untrust{color:#cbd5e1;border-color:#475569;background:#1e293b}
+  .b-web{color:#bfdbfe;border-color:#1d4ed8;background:#0b1e3b}
 
   .hwid{font-family:Consolas,monospace;font-size:11px;color:#7dd3fc;cursor:copy;white-space:nowrap}
   .hwid:hover{text-decoration:underline}
@@ -259,6 +260,9 @@
       badges += p.trusted
         ? '<span class="badge b-trust">授信用户</span>'
         : '<span class="badge b-untrust">未授信</span>';
+      if (p.web_account) {
+        badges += '<span class="badge b-web">网站: ' + esc(p.web_account) + "</span>";
+      }
 
       var hwid = p.hwid
         ? '<span class="hwid" data-hw="' + esc(p.hwid) + '" title="点击复制">' + esc(p.hwid) + "</span>"

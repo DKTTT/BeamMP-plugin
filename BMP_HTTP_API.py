@@ -70,7 +70,7 @@ _set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.5.0"
+VERSION = "BMP-HTTP/v1.6.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -1527,6 +1527,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "beammp_id": p.get("beammp_id", ""),
                 "bind_account": p.get("bind_account", ""),
                 "hwid": p.get("hwid", ""),
+                "web_verified": bool(p.get("web_verified")),
+                "web_account": p.get("web_account", ""),
                 "vehicle_count": p.get("vehicle_count", 0),
                 "join_time": join_ts,
                 "online_seconds": max(0, now - join_ts),
