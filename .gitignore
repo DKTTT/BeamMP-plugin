@@ -56,3 +56,8 @@ desktop.ini
 .idea/
 *.swp
 *~
+
+# --- 客户端本地配置 (含 token, 不提交) ---
+bmphwid_bridge_config.json
+bmphwid_last.json
+bmp_admin_config.json

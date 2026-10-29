@@ -27,9 +27,9 @@
 import re, os, sys, json, hashlib, threading, socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 HTTP_PORT = 7788
-PAYLOAD_VER = "Bridge-v2.3"
+PAYLOAD_VER = "Bridge-v2.4"
 HTTP_NAME = f"BMPHWID_Bridge/v{VERSION}"
 WIN_TITLE = f"BeamMP 认证器 v{VERSION}  —  HWID + 命令手册 + 直连服务器"
 
@@ -48,32 +48,56 @@ try:
 except Exception:
     CFG = {}
 
-def _hash_token(tok):
-    """本地存储时只存 token 的 SHA-256 hash, 防止被直接读取冒用"""
-    if not tok: return ""
-    return hashlib.sha256(tok.encode()).hexdigest()
-
 def _save_cfg():
+    """原子写配置.
+    旧实现: json.dump 直接写目标文件 (写到一半崩溃就变成截断 JSON -> 配置全丢),
+    并且 except: pass 把"无写权限"也吞掉, 用户每次启动都要重填服务器地址。"""
+    path = _get_cfg_path()
+    tmp = path + ".tmp"
     try:
-        # 只存 token hash, 不存明文
-        save_data = dict(CFG)
-        if save_data.get("access_token"):
-            save_data["_token_hash"] = _hash_token(save_data.pop("access_token"))
-        with open(_get_cfg_path(), "w", encoding="utf-8") as _f:
-            json.dump(save_data, _f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        with open(tmp, "w", encoding="utf-8") as _f:
+            json.dump(dict(CFG), _f, ensure_ascii=False, indent=2)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(tmp, path)
+        return True, None
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            print(f"[WARN] 配置保存失败 ({path}): {e}")
+        except Exception:
+            pass
+        return False, str(e)
 
 # ---- urllib 客户端 (POST JSON) ----
 import urllib.request, urllib.error
 
 def _norm_url(base):
-    """把用户输入的 URL 规范化: 自动补 http:// 前缀, 去尾斜杠"""
+    """把用户输入的 URL 规范化: 自动补 http:// 前缀, 去尾斜杠.
+    大小写不敏感 (HTTP://host 不能变成 http://HTTP://host);
+    地址里不能带路径 (http://host:12124/api 会让所有端点变成 /api/api/xxx)。"""
     base = (base or "").strip().rstrip("/")
     if not base:
         return "", "请先填入服务器 HTTP API 地址"
-    if not (base.startswith("http://") or base.startswith("https://")):
+    low = base.lower()
+    if low.startswith(("http://", "https://")):
+        # 统一小写 scheme, 避免出现 HTTP:// 这种输入被当成主机名
+        scheme, rest = base.split("://", 1)
+        base = scheme.lower() + "://" + rest
+    else:
         base = "http://" + base
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(base)
+        if parts.path not in ("", "/"):
+            return "", "服务器地址不要带路径, 只填 http://IP:端口"
+        if not parts.netloc:
+            return "", "服务器地址不合法"
+    except Exception:
+        pass
     return base, ""
 
 def api_post(path, body_obj=None, timeout=8):
@@ -100,8 +124,11 @@ def api_post(path, body_obj=None, timeout=8):
         try:
             raw = e.read() or b"{}"
             obj = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(obj, dict):
+                obj = {"ok": False, "msg": f"HTTP {e.code}"}
         except Exception:
             obj = {"ok": False, "msg": f"HTTP {e.code}: {str(e.reason)}"}
+        obj["_http"] = e.code
         return False, obj
     except Exception as e:
         return False, {"ok": False, "msg": "请求失败: " + str(e)}
@@ -115,9 +142,14 @@ def api_ping(timeout=6):
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             raw = resp.read() or b"{}"
             try:
-                return True, json.loads(raw.decode("utf-8"))
+                obj = json.loads(raw.decode("utf-8"))
             except Exception:
-                return True, {"ok": True, "msg": raw.decode("utf-8", errors="replace")[:200]}
+                # 返回 200 但不是 JSON: 说明地址/端口填到了别的东西上,
+                # 旧实现会亮绿灯, 然后每个 api_post 都失败
+                return False, {"ok": False, "msg": "返回不是 JSON 接口 (端口/地址填错了?)"}
+            if not isinstance(obj, dict):
+                return False, {"ok": False, "msg": "返回不是 JSON 接口 (端口/地址填错了?)"}
+            return True, obj
     except Exception as e:
         return False, {"ok": False, "msg": "不通: " + str(e)}
 
@@ -298,6 +330,19 @@ def _read_wmi_UUID():
         pass
     return []
 
+def _mac_is_usable(s):
+    """排除全零 / 组播位(0x01) / 本地管理位(0x02) 的伪 MAC.
+    Windows 上 uuid.getnode() 可能返回随机生成的本地管理地址, 不能当机器指纹。"""
+    if not s or len(s) < 17:
+        return False
+    try:
+        first = int(s.split(":")[0], 16)
+    except Exception:
+        return False
+    if first & 0x01 or first & 0x02:
+        return False
+    return s not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+
 def _read_physical_MACs():
     """优先 uuid.getnode() 首网卡 + ipconfig 全部 MAC"""
     macs = []
@@ -307,7 +352,7 @@ def _read_physical_MACs():
         addr = _u.getnode()
         if addr and addr != 0:
             s = ":".join(f"{(addr >> (8*(5-i))) & 0xff:02x}" for i in range(6))
-            if not s.startswith("00:00:00:00:00") and not s.startswith("02:00:00"):
+            if _mac_is_usable(s):
                 macs.append("MAC:" + s)
     except Exception:
         pass
@@ -322,7 +367,7 @@ def _read_physical_MACs():
         txt = _d(r.stdout or b"")
         for m in re.finditer(r"物理地址[^\n\r:：]*[：:]\s*([A-Fa-f0-9\-]{17})", txt):
             s = m.group(1).replace("-", ":").lower()
-            if s.startswith("00:00:00:00:00") or s.startswith("02:00:00"):
+            if not _mac_is_usable(s):
                 continue
             if not any(s in x for x in macs):
                 macs.append("MAC:" + s)
@@ -341,12 +386,29 @@ def fnv1a_hex(text):
         h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
     return f"{h:016x}"
 
+# 只参与指纹的"稳定源"前缀. MAC 是最不稳定的一类:
+# 装 Hyper-V / WSL2 / VPN / 换个 USB 网卡都会多出或消失一块网卡,
+# 旧实现把全部 MAC 都算进 hash, 于是"永久机器码"每次插拔网卡就变,
+# 账号绑定失效 + HWID 封禁形同虚设。
+STABLE_PREFIXES = ("MG:", "CSUID:")
+
 def build_stable_hwid(sources):
     """sources → UUIDv4 形式的永久 ID"""
-    if not sources:
-        import uuid as _u
-        return str(_u.uuid4()).lower()
-    concat = "||".join(sorted(set(sources)))
+    sources = [s for s in (sources or []) if isinstance(s, str) and s]
+    # 只把真正稳定的源 (MachineGuid / 主板 UUID) 算进指纹.
+    # MAC 完全不参与: 装 Hyper-V/WSL2/VPN/USB 网卡都会改变网卡集合,
+    # 用 MAC 做指纹等于"每次插拔网卡换一个机器码", 账号绑定和 HWID 封禁都会失效。
+    stable = sorted({s for s in sources if s.startswith(STABLE_PREFIXES)})
+    if not stable:
+        # 没有稳定源时使用"每份安装持久化一次"的兜底 ID, 至少跨重启稳定
+        fb = CFG.get("fallback_hwid")
+        if not fb:
+            import uuid as _u
+            fb = str(_u.uuid4()).lower()
+            CFG["fallback_hwid"] = fb
+            _save_cfg()
+        return fb
+    concat = "||".join(stable)
     h = fnv1a_hex(concat)
     # 拼成 UUIDv4 形式: xxxxxxxx-xxxx-4xxx-8/9/A/Bxxx-xxxxxxxxxxxx
     while len(h) < 32:
@@ -976,15 +1038,26 @@ def _run_gui(hwid, sources_list):
             pass
 
     def _log_response(obj, net_ok):
+        if not isinstance(obj, dict):
+            obj = {"ok": False, "msg": str(obj)}
         if not net_ok or not obj:
-            _log("❌ 网络错误: " + str(obj.get("msg") if isinstance(obj, dict) else obj))
+            _log("❌ 网络错误: " + str(obj.get("msg") or "请求失败"))
             return
         ok_flag = obj.get("ok")
-        msg = obj.get("msg") or "(无消息)"
+        # 服务端失败响应是 {ok:false, error:"..."} —— 旧实现只读 msg, 于是所有 4xx
+        # 都显示成 "网络错误: None"
+        msg = obj.get("msg") or obj.get("error") or "(无消息)"
+        code = obj.get("_http")
         if ok_flag:
             _log("✅ " + msg)
         else:
-            _log("❌ " + msg)
+            _log(("❌ [HTTP %s] " % code if code else "❌ ") + msg)
+            if code == 401:
+                # token 失效: 清掉本地登录态, 否则后面每个请求都 401
+                CFG.pop("access_token", None)
+                CFG.pop("username", None)
+                _save_cfg()
+                _refresh_sess_label()
         data = obj.get("data")
         if isinstance(data, dict):
             # 保存 token / username / label / limit
@@ -1071,27 +1144,27 @@ def _run_gui(hwid, sources_list):
         _save_cfg()
         body = {"username": u, "password": pw, "hwid": hwid,
                 "player_name": CFG["last_player_name"]}
-        # DEBUG: 打印实际发送的 body (密码脱敏)
-        _safe_pw = pw[:3] + "***" + pw[-3:] if len(pw) >= 6 else "*" * len(pw)
-        _log(f"[DEBUG] 发送登录请求: user={u!r} pwd={_safe_pw!r} pwd_len={len(pw)} body_keys={list(body.keys())}")
+        # 不再打印密码片段/完整响应体: 响应里含 access_token, 日志面板是可见的
+        _log(f"登录请求: user={u!r} pwd_len={len(pw)}")
         net_ok, obj = api_post("/api/auth/login", body)
-        _log(f"[DEBUG] API 响应: net_ok={net_ok} obj={json.dumps(obj, ensure_ascii=False)[:200] if isinstance(obj, dict) else obj}")
-        if net_ok and obj.get("ok"):
-            # 关键修复: 登录成功后立即保存 token 到 CFG (确保后续 whoami 能带 token)
+        if net_ok and isinstance(obj, dict) and obj.get("ok"):
+            # 登录成功后立即保存 token 到 CFG (确保后续 whoami 能带 token)
             d = obj.get("data") or {}
             if d.get("access_token"):
                 CFG["access_token"] = d["access_token"]
                 CFG["username"] = d.get("username") or u
                 _save_cfg()
-                _log(f"[DEBUG] token 已保存: {d['access_token'][:10]}...")
             # 现在 CFG 已有新 token, whoami 能正确带 Authorization 头
             net_ok2, obj2 = api_post("/api/auth/whoami", {})
-            _log(f"[DEBUG] whoami 响应: {json.dumps(obj2, ensure_ascii=False)[:200] if isinstance(obj2, dict) else obj2}")
             _log_response(obj, True)
             _log_response(obj2, net_ok2)
         else:
-            # 登录失败: 清掉旧 token 防止后续请求混乱
-            CFG.pop("access_token", None)
+            if isinstance(obj, dict) and obj.get("ok") is False:
+                # 只有服务端真的拒绝了才清 token; 纯网络失败不该把有效登录踢掉
+                CFG.pop("access_token", None)
+                CFG.pop("username", None)
+                _save_cfg()
+            _refresh_sess_label()
             _log_response(obj, net_ok)
 
     tk.Button(tl, text="🚀 登录", font=("Microsoft YaHei UI", 11, "bold"),
@@ -1101,13 +1174,14 @@ def _run_gui(hwid, sources_list):
 
     def _do_logout():
         net_ok, obj = api_post("/api/auth/logout", {})
-        if net_ok and obj.get("ok"):
-            CFG.pop("access_token", None)
-            CFG.pop("username", None)
-            CFG.pop("label", None)
-            CFG.pop("limit", None)
-            _save_cfg()
-            _refresh_sess_label()
+        # 无论服务端怎么回 (API 重启后内存 token 全丢, 会返回 ok:false),
+        # 本地都必须真的登出, 否则用户永远卡在"已登录"
+        CFG.pop("access_token", None)
+        CFG.pop("username", None)
+        CFG.pop("label", None)
+        CFG.pop("limit", None)
+        _save_cfg()
+        _refresh_sess_label()
         _log_response(obj, net_ok)
 
     tk.Button(tl, text="退出登录", font=("Microsoft YaHei UI", 10),
@@ -1163,6 +1237,9 @@ def _run_gui(hwid, sources_list):
     e_b_id.insert(0, hwid)
     e_b_id.config(state="readonly")
     e_b_id.grid(row=0, column=1, columnspan=2, padx=8, pady=4, sticky="w")
+    # 手动占用了 row 0, 必须把 _row 推进到 1, 否则下面的 _grid_entry 会把
+    # "游戏名"的标签/输入框正好盖在 "本机 HWID" 那一行上
+    _row = 1
     e_b_name = _grid_entry(tb, "游戏名(可选): ", default=CFG.get("last_player_name") or "")
     tb.columnconfigure(1, weight=1)
 
@@ -1368,13 +1445,17 @@ def _run_gui(hwid, sources_list):
             lbl_vote_status.configure(text="请先在左边选择目标玩家", fg="#dc2626")
             return
         target = list_players.get(sel[0])
+        # 列表里的 "(暂无玩家在线)" / "(连接服务器失败)" 是占位行, 不能当真玩家发起投票
+        if not target or target.startswith("("):
+            lbl_vote_status.configure(text="请选择真实的在线玩家", fg="#dc2626")
+            return
         reason = e_vote_reason.get().strip()
         body = {"target_name": target, "initiator_name": name, "reason": reason}
         net_ok, obj = api_post("/api/vote/kick", body)
         if net_ok and obj.get("ok"):
             lbl_vote_status.configure(text=f"已发起对 {target} 的投票", fg="#16a34a")
         else:
-            lbl_vote_status.configure(text=obj.get("error", "发起失败"), fg="#dc2626")
+            lbl_vote_status.configure(text=obj.get("error") or obj.get("msg") or "发起失败", fg="#dc2626")
     
     tk.Button(vk_init_frame, text="⚡ 发起投票踢出", font=("Microsoft YaHei UI", 10, "bold"),
               bg="#dc2626", fg="white", activebackground="#b91c1c", activeforeground="white",
@@ -1525,6 +1606,26 @@ def _run_gui(hwid, sources_list):
             pass
 
 
+def _emit(text):
+    """CLI 输出. 打包成 --windowed 的 EXE 里 sys.stdout 是 None,
+    旧实现直接 sys.stdout.write 会 AttributeError, 然后被 except 吞掉 -> 退出码 0 但没有任何输出。"""
+    out = sys.stdout
+    if out is not None:
+        try:
+            out.write(text + "\n")
+            out.flush()
+            return
+        except Exception:
+            pass
+    # 没有控制台时落盘, 方便脚本读取
+    try:
+        path = os.path.join(os.path.dirname(_get_cfg_path()), "bmphwid_last.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+
+
 def _run_cli_print(hwid, sources_list):
     """无 tkinter 时的 CLI 模式"""
     payload = {
@@ -1535,8 +1636,7 @@ def _run_cli_print(hwid, sources_list):
         "sources": sources_list,
         "command": f"/bmpid {hwid}",
     }
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    _emit(json.dumps(payload, ensure_ascii=False))
 
 
 # ============================================================
@@ -1574,11 +1674,10 @@ if __name__ == "__main__":
         try:
             ss = collect_sources()
             hw = build_stable_hwid(ss)
-            sys.stdout.write(json.dumps({
+            _emit(json.dumps({
                 "ok": True, "ver": PAYLOAD_VER, "hwid": hw, "sources": ss,
                 "command": f"/bmpid {hw}",
-            }, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            }, ensure_ascii=False))
         except Exception:
             pass
         sys.exit(0)

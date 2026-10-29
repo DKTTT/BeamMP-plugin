@@ -32,24 +32,43 @@
 """
 
 import re, os, sys, json, hashlib, hmac, time, threading, secrets, argparse, ipaddress, uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 # 共享路径 — 和 main.lua 一致
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("BMP_DATA_DIR") or os.path.join(_HERE, "bmp_login")
-ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
-GUESTMAP_FILE = os.path.join(DATA_DIR, "guestmap.json")
-BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
-CHAT_QUEUE_FILE = os.path.join(DATA_DIR, "chat_queue.json")
-ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
-KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
-VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+ACCOUNTS_FILE = GUESTMAP_FILE = BANLIST_FILE = CHAT_QUEUE_FILE = None
+ONLINE_FILE = KICK_QUEUE_FILE = VOTE_QUEUE_FILE = ADMIN_AUDIT_FILE = None
+
+
+class DataFileError(RuntimeError):
+    """数据文件存在但无法解析 (损坏 / 写到一半) —— 必须拒绝写入, 绝不当成空库"""
+
+
+def _set_data_dir(path):
+    """统一推导全部数据文件路径.
+    以前 --data-dir 只改了 6 个路径, 漏了 chat_queue.json / admin_audit.jsonl,
+    导致 Bridge 聊天写进旧目录, Lua 插件永远读不到 (聊天完全不广播)。"""
+    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, CHAT_QUEUE_FILE
+    global ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE, ADMIN_AUDIT_FILE
+    DATA_DIR = os.path.abspath(path)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+    GUESTMAP_FILE = os.path.join(DATA_DIR, "guestmap.json")
+    BANLIST_FILE = os.path.join(DATA_DIR, "banlist.json")
+    CHAT_QUEUE_FILE = os.path.join(DATA_DIR, "chat_queue.json")
+    ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
+    KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
+    VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
+    ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "admin_audit.jsonl")
+
+
+_set_data_dir(DATA_DIR)
 
 VEHICLE_LIMITS = {"admin": 999, "authenticated": 5, "unauthenticated": 1}
 DEFAULT_API_PORT = 12124
-VERSION = "BMP-HTTP/v1.0.0"
+VERSION = "BMP-HTTP/v1.1.0"
 ACCESS_TTL = 7 * 24 * 3600  # 7 天
 
 # 聊天速率限制: name -> [时间戳列表]
@@ -67,7 +86,7 @@ LOGIN_LOCKOUT_SECONDS = 600  # 超限后锁定 10 分钟
 MAX_BODY_SIZE = 65536    # 64 KB (JSON body)
 
 # ---- 管理员审计日志 ----
-ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "admin_audit.jsonl")
+# ADMIN_AUDIT_FILE 由 _set_data_dir() 统一赋值
 
 def _audit_log(action, admin, target="", detail=""):
     """管理员操作审计 — 追加写入 JSONL (每行一条, 不截断)"""
@@ -142,16 +161,20 @@ def _deduplicate_bids(bids):
     return result
 
 def readJsonFile(path):
-    if not os.path.exists(path): return None
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            return json.loads(f.read() or "null")
-    except Exception:
+    """读 JSON. 文件不存在 -> None; 文件损坏 -> 抛 DataFileError.
+
+    旧实现把所有异常都吞成 None, 于是"文件损坏"和"文件不存在"无法区分,
+    随后的注册/封禁会把整份 accounts.json / banlist.json 覆盖成只剩一条记录。"""
+    if not os.path.exists(path):
+        return None
+    last = None
+    for enc in ("utf-8-sig", "utf-8"):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding=enc) as f:
                 return json.loads(f.read() or "null")
-        except Exception:
-            return None
+        except (OSError, ValueError) as e:
+            last = e
+    raise DataFileError(f"{os.path.basename(path)}: {last}")
 
 def writeJsonFile(path, obj):
     tmp = path + ".tmp"
@@ -172,11 +195,16 @@ def writeJsonFile(path, obj):
 #      (ASCII 32..126 可打印字符，含符号空格, 不是 hex sha256)
 # ============================================================
 def _lua_hash64(password, salt_hex):
+    # 必须按 UTF-8 字节计算, 与 main.lua 的 password:byte(i) / #password 一致;
+    # 旧实现按 Unicode 码点算, 中文密码在游戏内永远登录失败
+    if not isinstance(password, str) or password == "":
+        raise ValueError("empty password")
+    pwd = password.encode("utf-8")
     salt_bytes = [int(salt_hex[i:i+1], 16) for i in range(16)]
-    pwd_len = max(1, len(password))
+    pwd_len = max(1, len(pwd))
     out = []
     for i in range(1, 65):
-        ci = ord(password[(i - 1) % pwd_len])
+        ci = pwd[(i - 1) % pwd_len]
         si = salt_bytes[(i - 1) % 8]
         out.append(chr(((ci + si + i) % 95) + 32))
     return "".join(out)
@@ -188,6 +216,7 @@ def hashPassword(password):
 
 def verifyPassword(password, stored):
     if not stored: return False
+    if not isinstance(password, str) or password == "": return False
     # 格式 1: "salt_hex16:hash64" (main.lua / API 注册的新账号)
     if ":" in stored:
         # salt 在最左, hash 在最后一个冒号之后 (main.lua verify: 匹配^([^:]+): 和 :(.+)$)
@@ -220,28 +249,35 @@ def _salted_hash_sha256(password, salt_hex=None):
 #  共享数据: accounts / guestmap / banlist
 # ============================================================
 def loadAccounts():
-    data = readJsonFile(ACCOUNTS_FILE) or {}
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, dict):
-                v["bind_beam_ids"] = _ensure_list(v.get("bind_beam_ids"))
-                v["login_records"] = _ensure_list(v.get("login_records"))
+    data = readJsonFile(ACCOUNTS_FILE)
+    if data is None or (isinstance(data, list) and not data):
+        data = {}
+    if not isinstance(data, dict):
+        raise DataFileError("accounts.json: 顶层不是对象")
+    for k, v in data.items():
+        if isinstance(v, dict):
+            v["bind_beam_ids"] = _ensure_list(v.get("bind_beam_ids"))
+            v["login_records"] = _ensure_list(v.get("login_records"))
     return data
 
 def saveAccounts(data):
     return writeJsonFile(ACCOUNTS_FILE, data)
 
 def loadGuestMap():
-    return readJsonFile(GUESTMAP_FILE) or {}
+    data = readJsonFile(GUESTMAP_FILE)
+    return data if isinstance(data, dict) else {}
 
 def saveGuestMap(gm):
     return writeJsonFile(GUESTMAP_FILE, gm)
 
 def loadBanlist():
-    data = readJsonFile(BANLIST_FILE) or {}
-    if isinstance(data, dict):
-        data["devices"] = _ensure_list(data.get("devices"))
-        data["accounts"] = _ensure_list(data.get("accounts"))
+    data = readJsonFile(BANLIST_FILE)
+    if data is None or (isinstance(data, list) and not data):
+        data = {}
+    if not isinstance(data, dict):
+        raise DataFileError("banlist.json: 顶层不是对象")
+    data["devices"] = _ensure_list(data.get("devices"))
+    data["accounts"] = _ensure_list(data.get("accounts"))
     return data
 
 # ============================================================
@@ -292,6 +328,26 @@ def _find_account(accounts, bids):
                 return username
     return None
 
+def _account_is_admin(accounts, username):
+    """ADMINS 集合 或 accounts.json 里持久化的 is_admin 都算管理员"""
+    if not username:
+        return False
+    if username in ADMINS:
+        return True
+    acc = accounts.get(username) if isinstance(accounts, dict) else None
+    return bool(isinstance(acc, dict) and acc.get("is_admin"))
+
+def _revoke_user_tokens(username):
+    """改密/删号/撤管理员时立刻作废该账号所有 token.
+    旧实现只校验过期时间, 密码被重置后攻击者手里的 token 还能用满 7 天。"""
+    if not username:
+        return 0
+    with TOKENS_LOCK:
+        to_pop = [t for t, info in TOKENS.items() if info.get("username") == username]
+        for t in to_pop:
+            TOKENS.pop(t, None)
+    return len(to_pop)
+
 # Access tokens: token -> {username, issued_at, expires_at}
 TOKENS = {}
 TOKENS_LOCK = threading.Lock()
@@ -315,7 +371,27 @@ def _validate_token(auth_header):
         if info["expires_at"] < int(time.time()):
             TOKENS.pop(tok, None)
             return None
-        return info["username"]
+        username = info["username"]
+    # 账号已被删除时 token 立即失效 (读到损坏文件时不要阻断已登录用户)
+    try:
+        accounts = loadAccounts()
+        if username not in accounts:
+            with TOKENS_LOCK:
+                TOKENS.pop(tok, None)
+            return None
+    except DataFileError:
+        pass
+    return username
+
+def _get_str(body, key, default=""):
+    """安全取字符串字段: 任何非字符串类型 (数字 / None / list) 一律返回默认值"""
+    v = body.get(key) if isinstance(body, dict) else None
+    return v.strip() if isinstance(v, str) else default
+
+
+class BodyTooLarge(Exception):
+    pass
+
 
 # ============================================================
 #  HTTP Handler
@@ -323,9 +399,21 @@ def _validate_token(auth_header):
 class APIHandler(BaseHTTPRequestHandler):
     server_version = VERSION
     protocol_version = "HTTP/1.1"
+    timeout = 15          # 慢连接不能无限占着 handler 线程
 
     def log_message(self, fmt, *args):
         return
+
+    def _client_allowed(self):
+        """--allow-ips 白名单. 旧实现只在 do_POST 里判断, 所有 GET 全部绕过"""
+        subnets = getattr(self.server, "cfg", {}).get("allow_subnets")
+        if not subnets:
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return any(ip_obj in n for n in subnets)
 
     def _json(self, status, body):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -351,10 +439,13 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception:
             length = 0
         if length > MAX_BODY_SIZE:
-            # 拒绝超大请求
-            self._json(413, {"ok": False, "error": f"请求体过大 (最大 {MAX_BODY_SIZE} 字节)"})
+            # 抛异常交给 do_POST 统一发 413, 否则会先发 413 再发 400 (双响应)
+            raise BodyTooLarge()
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except (OSError, TimeoutError):
+            self.close_connection = True
             return None
-        raw = self.rfile.read(length) if length > 0 else b""
         if not raw: return {}
         try:
             return json.loads(raw.decode("utf-8"))
@@ -365,11 +456,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self._json(204, {})
 
     def do_GET(self):
+        if not self._client_allowed():
+            self._json(403, {"ok": False, "error": "IP not allowed"})
+            return
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/", "/api/ping"):
             self._json(200, {"ok": True, "ver": VERSION,
-                             "now": int(time.time()),
-                             "data_dir": DATA_DIR})
+                             "now": int(time.time())})
             return
         if path == "/api/chat/queue":
             return self._chat_queue(getattr(self, "_auth_cache", None))
@@ -380,24 +473,31 @@ class APIHandler(BaseHTTPRequestHandler):
         self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        try:
+            return self._do_post_impl()
+        except BodyTooLarge:
+            return self._json(413, {"ok": False, "error": f"请求体过大 (最大 {MAX_BODY_SIZE} 字节)"})
+        except DataFileError as e:
+            return self._json(503, {"ok": False, "error": f"数据文件损坏, 已拒绝写入: {e}"})
+        except Exception as e:
+            try:
+                self._json(500, {"ok": False, "error": f"服务器内部错误: {e}"})
+            except Exception:
+                pass
+
+    def _do_post_impl(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         # 先检查 IP 白名单
-        cfg = getattr(self.server, "cfg", {})
-        allow_subnets = cfg.get("allow_subnets")
-        if allow_subnets:
-            client_ip = self.client_address[0]
-            try:
-                ip_obj = ipaddress.ip_address(client_ip)
-                if not any(ip_obj in n for n in allow_subnets):
-                    self._json(403, {"ok": False, "error": "IP not allowed"})
-                    return
-            except Exception:
-                self._json(403, {"ok": False, "error": "IP parse error"})
-                return
+        if not self._client_allowed():
+            self._json(403, {"ok": False, "error": "IP not allowed"})
+            return
 
         body = self._read_body()
         if body is None:
             self._json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"ok": False, "error": "JSON body must be an object"})
             return
 
         auth = self.headers.get("Authorization", "")
@@ -441,16 +541,23 @@ class APIHandler(BaseHTTPRequestHandler):
 
     # ============= 业务实现 =============
     def _register(self, body):
-        username = (body.get("username") or "").strip()
-        password = body.get("password") or ""
-        hwid = (body.get("hwid") or "").strip()
-        ip = (body.get("ip") or "").strip()
-        player_name = (body.get("player_name") or "").strip()
+        username = _get_str(body, "username")
+        password = body.get("password")
+        hwid = _get_str(body, "hwid")
+        # IP 一律取真实 socket 对端, 不能听客户端自报 (否则可抢占别人的 IP 绑定)
+        ip = self.client_address[0]
+        player_name = _get_str(body, "player_name")
 
         if not re.match(r"^[A-Za-z0-9_]{3,20}$", username):
             return self._json(200, {"ok": False, "msg": "账号名不合法 (3-20 字符, 字母/数字/下划线)"})
+        if not isinstance(password, str):
+            return self._json(200, {"ok": False, "msg": "密码不合法 (4-64 字符)"})
         if len(password) < 4 or len(password) > 64:
             return self._json(200, {"ok": False, "msg": "密码不合法 (4-64 字符)"})
+        # 管理员账号名是保留名: 否则任何人都能抢注 --admins 里的名字拿到管理员权限
+        if username in ADMINS:
+            return self._json(403, {"ok": False,
+                                    "msg": "该账号名为管理员保留名, 请先在服务器本机创建账号"})
 
         with FILE_LOCK:
             accounts = loadAccounts()
@@ -478,12 +585,19 @@ class APIHandler(BaseHTTPRequestHandler):
         })
 
     def _login(self, body):
-        username = (body.get("username") or "").strip()
-        password = body.get("password") or ""
-        hwid = (body.get("hwid") or "").strip()
-        ip = (body.get("ip") or "").strip()
-        player_name = (body.get("player_name") or "").strip()
+        username = _get_str(body, "username")
+        password = body.get("password")
+        hwid = _get_str(body, "hwid")
+        # 同上: 用真实对端 IP
+        ip = self.client_address[0]
+        player_name = _get_str(body, "player_name")
         client_ip = self.client_address[0]
+
+        # 空密码 / 非字符串密码: 直接当密码错误处理 (不能抛异常, 否则不记录限速)
+        if not isinstance(password, str) or password == "":
+            if username:
+                _record_login_attempt(client_ip, username)
+            return self._json(200, {"ok": False, "msg": "账号或密码不正确"})
 
         # ---- 登录速率限制 (防暴力破解) ----
         if username:
@@ -541,7 +655,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 saveGuestMap(gm)
 
         # 登录成功 — 清空速率限制记录
-        if username and username in LOGIN_RATE:
+        # (旧代码 keys 是 "ip:username", 却用 `username in LOGIN_RATE` 判断,
+        #  条件永远为假 -> 失败次数跨成功登录持续累计, 正常用户也会被锁)
+        if username:
             LOGIN_RATE.pop(f"{client_ip}:{username}", None)
 
         token = _issue_token(username)
@@ -883,28 +999,33 @@ class APIHandler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "data": result})
 
     def _admin_delete_account(self, body):
-        target = (body.get("username") or "").strip()
+        target = _get_str(body, "username")
         if not target:
             return self._json(400, {"ok": False, "error": "缺少 username"})
-        if target in ADMINS:
-            return self._json(400, {"ok": False, "error": f"不能删除管理员 {target}"})
         with FILE_LOCK:
             accounts = loadAccounts()
+            # 用 _account_is_admin 而不是 `target in ADMINS`:
+            # is_admin 是持久化字段, 重启后 ADMINS 里看不到, 旧写法会允许删除管理员
+            if _account_is_admin(accounts, target):
+                return self._json(400, {"ok": False, "error": f"不能删除管理员 {target}"})
             if target not in accounts:
                 return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
             del accounts[target]
-            saveAccounts(accounts)
+            ok, err = saveAccounts(accounts)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"accounts 写入失败: {err}"})
             # 同步清理 guestmap 里指向该账号的条目
             gm = loadGuestMap()
             cleaned = {k: v for k, v in gm.items()
                       if not (isinstance(v, dict) and v.get("account") == target)}
             saveGuestMap(cleaned)
+        _revoke_user_tokens(target)
         return self._json(200, {"ok": True, "msg": f"账号 {target} 已删除"})
 
     def _admin_reset_password(self, body):
-        target = (body.get("username") or "").strip()
-        new_pw = body.get("new_password") or ""
-        if not target or not new_pw:
+        target = _get_str(body, "username")
+        new_pw = body.get("new_password")
+        if not target or not isinstance(new_pw, str) or not new_pw:
             return self._json(400, {"ok": False, "error": "需要 username 和 new_password"})
         if len(new_pw) < 4:
             return self._json(400, {"ok": False, "error": "密码至少 4 位"})
@@ -913,11 +1034,14 @@ class APIHandler(BaseHTTPRequestHandler):
             if target not in accounts:
                 return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
             accounts[target]["password_hash"] = hashPassword(new_pw)
-            saveAccounts(accounts)
+            ok, err = saveAccounts(accounts)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"accounts 写入失败: {err}"})
+        _revoke_user_tokens(target)
         return self._json(200, {"ok": True, "msg": f"账号 {target} 密码已重置"})
 
     def _admin_toggle_admin(self, body):
-        target = (body.get("username") or "").strip()
+        target = _get_str(body, "username")
         set_admin = bool(body.get("is_admin", False))
         if not target:
             return self._json(400, {"ok": False, "error": "缺少 username"})
@@ -927,17 +1051,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": f"账号 {target} 不存在"})
             # 持久化 is_admin 到 accounts.json (供 Lua 插件读取)
             accounts[target]["is_admin"] = set_admin
-            saveAccounts(accounts)
+            ok, err = saveAccounts(accounts)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"accounts 写入失败: {err}"})
             if set_admin:
                 ADMINS.add(target)
             else:
                 ADMINS.discard(target)
+        if not set_admin:
+            _revoke_user_tokens(target)
         return self._json(200, {"ok": True, "msg": f"{target} 管理员权限: {'已开启' if set_admin else '已关闭'}",
                                "data": {"is_admin": set_admin, "admins": sorted(ADMINS)}})
 
     def _admin_unbind(self, body):
-        target = (body.get("username") or "").strip()
-        beam_id = (body.get("beam_id") or "").strip()
+        target = _get_str(body, "username")
+        beam_id = _get_str(body, "beam_id")
         if not target or not beam_id:
             return self._json(400, {"ok": False, "error": "需要 username 和 beam_id"})
         with FILE_LOCK:
@@ -949,7 +1077,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": f"绑定 {beam_id} 不存在"})
             bids.remove(beam_id)
             accounts[target]["bind_beam_ids"] = bids
-            saveAccounts(accounts)
+            ok, err = saveAccounts(accounts)
+            if not ok:
+                return self._json(500, {"ok": False, "error": f"accounts 写入失败: {err}"})
             # 同步清理 guestmap
             gm = loadGuestMap()
             if beam_id in gm:
@@ -958,10 +1088,13 @@ class APIHandler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "msg": f"已解除 {target} 的绑定 {beam_id}"})
 
     def _admin_ban(self, body):
-        target_type = (body.get("type") or "").strip()  # account / hwid / ip / name
-        target_val = (body.get("value") or "").strip()
-        reason = (body.get("reason") or "").strip()
-        duration_days = int(body.get("duration_days") or 0)  # 0 = 永久
+        target_type = _get_str(body, "type")  # account / hwid / ip / name
+        target_val = _get_str(body, "value")
+        reason = _get_str(body, "reason")
+        try:
+            duration_days = int(body.get("duration_days") or 0)  # 0 = 永久
+        except (TypeError, ValueError):
+            return self._json(400, {"ok": False, "error": "duration_days 必须是整数"})
         if not target_type or not target_val:
             return self._json(400, {"ok": False, "error": "需要 type(account/hwid/ip/name) 和 value"})
         if target_type not in ("account", "hwid", "ip", "name"):
@@ -1279,7 +1412,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def _run_server(host, port, cfg):
-    httpd = HTTPServer((host, port), APIHandler)
+    # ThreadingHTTPServer: 旧版 HTTPServer 单线程, 一个慢连接就能卡死整个 API
+    httpd = ThreadingHTTPServer((host, port), APIHandler)
+    httpd.daemon_threads = True
     httpd.cfg = cfg
     httpd.start_time = int(time.time())
 
@@ -1293,13 +1428,19 @@ def _run_server(host, port, cfg):
             ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-            print(f"[{VERSION}] 监听 {host}:{port}  (🔒 HTTPS/TLS)")
+            print(f"[{VERSION}] 监听 {host}:{port}  (HTTPS/TLS)")
         except Exception as e:
-            print(f"[!] TLS 启动失败, 回退到 HTTP: {e}")
-            print(f"[{VERSION}] 监听 {host}:{port}")
+            # 必须 fail-closed: 用户显式要求 HTTPS 却静默降级成明文,
+            # 会让所有玩家密码/token 在公网明文传输
+            print(f"[FATAL] TLS 启动失败, 已中止: {e}")
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+            raise SystemExit(1)
     else:
         print(f"[{VERSION}] 监听 {host}:{port}")
-        print("  ⚠️  未启用 TLS — 公网部署建议配置 --tls-cert / --tls-key")
+        print("  [警告] 未启用 TLS — 公网部署建议配置 --tls-cert / --tls-key")
 
     print(f"  数据目录: {DATA_DIR}")
     print(f"  管理员名单: {sorted(ADMINS) if ADMINS else '(空)'}")
@@ -1322,7 +1463,16 @@ def _run_server(host, port, cfg):
 
 
 def main():
-    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS, ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE
+    # stdout 被重定向 (Windows 服务 / 计划任务 / > api.log) 时, Python 会用本地
+    # 编码 (GBK/cp1252) 打印中文和 emoji 直接 UnicodeEncodeError, 进程起不来
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    global DATA_DIR, ACCOUNTS_FILE, GUESTMAP_FILE, BANLIST_FILE, ADMINS
+    global CHAT_QUEUE_FILE, ONLINE_FILE, KICK_QUEUE_FILE, VOTE_QUEUE_FILE, ADMIN_AUDIT_FILE
     p = argparse.ArgumentParser(description="BMPLogin HTTP API 服务器 (Bridge.exe 直连用)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=DEFAULT_API_PORT)
@@ -1338,17 +1488,33 @@ def main():
     args = p.parse_args()
 
     if args.data_dir:
-        DATA_DIR = os.path.abspath(args.data_dir)
-        ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
-        GUESTMAP_FILE = os.path.join(DATA_DIR, "guestmap.json")
-        BANLIST_FILE  = os.path.join(DATA_DIR, "banlist.json")
-        ONLINE_FILE = os.path.join(DATA_DIR, "online_players.json")
-        KICK_QUEUE_FILE = os.path.join(DATA_DIR, "kick_queue.json")
-        VOTE_QUEUE_FILE = os.path.join(DATA_DIR, "vote_queue.json")
-        os.makedirs(DATA_DIR, exist_ok=True)
+        # 统一改全部路径 (含 chat_queue.json / admin_audit.jsonl)
+        _set_data_dir(args.data_dir)
 
     if args.admins:
         ADMINS = set(a.strip() for a in args.admins.split(",") if a.strip())
+        # 把 --admins 同步进 accounts.json 的 is_admin 字段,
+        # 否则 Lua 插件 (只认 accounts.json) 不认这些管理员, HTTP 与游戏内权限不一致
+        try:
+            _accounts = loadAccounts()
+            _missing = []
+            _changed = False
+            for _a in sorted(ADMINS):
+                if isinstance(_accounts.get(_a), dict):
+                    if not _accounts[_a].get("is_admin"):
+                        _accounts[_a]["is_admin"] = True
+                        _changed = True
+                else:
+                    _missing.append(_a)
+            if _changed:
+                _ok, _err = saveAccounts(_accounts)
+                if not _ok:
+                    print(f"[WARN] 同步 --admins 到 accounts.json 失败: {_err}")
+            if _missing:
+                print(f"[WARN] 以下管理员账号尚未注册, 请先在服务器本机创建: {_missing}")
+        except DataFileError as e:
+            print(f"[FATAL] accounts.json 无法解析, 已中止: {e}")
+            raise SystemExit(1)
 
     # 解析 --allow-ips
     allow_subnets = None
@@ -1358,10 +1524,13 @@ def main():
             tok = tok.strip()
             if not tok: continue
             try:
-                if "/" in tok:
-                    allow_subnets.append(ipaddress.ip_network(tok, strict=False))
-                else:
-                    allow_subnets.append(ipaddress.ip_network(tok + "/32", strict=False))
+                _net = ipaddress.ip_network(tok, strict=False) if "/" in tok else None
+                if _net is None:
+                    _addr = ipaddress.ip_address(tok)
+                    # IPv4 补 /32, IPv6 补 /128 (旧代码一律 /32, 把 ::1 变成 ::1/32)
+                    _net = ipaddress.ip_network(("%s/%d" % (tok, 32 if _addr.version == 4 else 128)),
+                                                strict=False)
+                allow_subnets.append(_net)
             except Exception as e:
                 print(f"[WARN] 跳过无效的白名单条目 {tok}: {e}")
 

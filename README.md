@@ -109,9 +109,9 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 
 | 角色 | 车辆上限 | 获得方式 |
 |---|---|---|
-| 管理员 | 999 | `--admins` 参数 |
+| 管理员 | 999 | `accounts.json` 的 `is_admin` / `--admins` 参数 |
 | 已认证玩家 | 5 | 登录账号 + 绑定 HWID |
-| 未认证游客 | 1 | 不登录直接进服 |
+| 未认证游客 | 0 | 不登录直接进服 (禁止刷车) |
 
 ---
 
@@ -119,17 +119,20 @@ New-NetFirewallRule -DisplayName "BMP HTTP API" -Direction Inbound -Protocol TCP
 
 | 措施 | 说明 |
 |---|---|
-| 密码存储 | 盐值哈希 (非明文, 与 Lua 插件双向兼容) |
+| 密码存储 | 盐值哈希 (非明文, 与 Lua 插件双向兼容; 按 UTF-8 字节计算, 支持中文密码) |
 | Token | `secrets.token_urlsafe` CSPRNG + 7 天 TTL |
-| 登录速率限制 | 5 次/5 分钟, 锁定 10 分钟 (防暴力破解) |
+| 登录速率限制 | 5 次/5 分钟, 锁定 10 分钟 (防暴力破解); 登录成功后清零 |
 | 请求体限制 | 64 KB (防内存耗尽) |
 | 账号枚举防护 | 统一错误消息, 不暴露账号是否存在 |
 | 安全响应头 | `X-Content-Type-Options` / `X-Frame-Options` / `Cache-Control` |
 | 审计日志 | 管理员所有写操作记录到 `admin_audit.jsonl` |
-| HTTPS/TLS | `--tls-cert` + `--tls-key` 启用 TLS 1.2+ |
-| Token 本地存储 | Bridge/Admin 只存 SHA-256 hash, 不留明文 |
-| IP 白名单 | `--allow-ips 114.0.0.0/8,192.168.0.0/16` |
+| HTTPS/TLS | `--tls-cert` + `--tls-key` 启用 TLS 1.2+ (证书出错直接拒绝启动, 不会静默降级明文) |
+| Token 本地存储 | Bridge/Admin 存在用户目录的配置文件里 (必须可回读才能自动登录, 请勿分享该文件) |
+| IP 白名单 | `--allow-ips 114.0.0.0/8,192.168.0.0/16` (POST 与 GET 全部生效) |
 | 聊天速率 | 6 条/分钟 |
+| 管理员账号名 | `--admins` 里的账号名是保留名, 不能被匿名注册抢注 |
+| 数据文件保护 | `accounts.json` / `banlist.json` 解析失败时拒绝写入 (503), 不会用空库覆盖真实数据 |
+| Token 吊销 | 改密码 / 删账号 / 撤销管理员时立刻作废该账号所有 token |
 
 ---
 
@@ -186,6 +189,73 @@ py -3 BMP_HTTP_API.py --admins "DRIFTKING,admin2,admin3"
 ---
 
 ## 📋 变更日志
+
+### v3.1.0 (2026-10-29) — 兼容 BeamMP-Server v3.9.4 + 大批 bug 修复
+
+**新版本适配**
+- ✅ 适配 BeamMP-Server **v3.9.4** 新增的 `MP.GetServerTime()` / `MP.GetServerTimeMS()`
+  - 投票踢出倒计时、发起冷却改用它 (steady_clock 单调时钟, 系统时间被改动/NTP 跳变都算不错)
+  - 旧版服务端 (≤ v3.9.3) 没有这两个函数, 自动回退 `os.time()`, 启动日志会打印当前时间源
+  - 封禁到期时间等"绝对时间戳"仍用 `os.time()`, 与 Python 的 epoch 语义保持一致
+- ✅ 车辆上限与 HTTP API 对齐: 管理员 999 / 认证 5 / 游客 0
+
+**Lua 插件 (main.lua) 关键修复**
+- 🐞 **管理员命令全部失效**: `isPlayerAdmin()` 调用的 `getPlayerStableInfo` 是后面才声明的
+  `local` 函数, 编译期变成全局查找 → 运行时 `attempt to call a nil value`。
+  受影响: `/listonline /kick /ban /unban /listadmins /addadmin /removeadmin /cancelvote`
+  以及 `/votekick`(内部要判断目标是不是管理员)。已加前置声明。
+- 🐞 **封禁列表 / 各队列被清空**: `jsonEncode` 只认 `Array()` 打过标记的表, 普通顺序数组
+  `{a,b,c}` 会被当成空对象写成 `{}`。后果: `/ban`、`/unban`、踢人队列、投票队列、
+  聊天队列每次写入都会把已有数据全部抹掉。已改为自动识别 1..n 的顺序数组。
+- 🐞 空密码会让 `(i-1) % pwdLen` 变成 `% 0` 直接报错 → 已加校验
+- 🐞 目录创建只用了 Windows 的 `if not exist ... mkdir` → Linux 服务端写文件全部失败, 现按平台区分
+- 🐞 写文件改为「先写 `.tmp` 再 rename」, 避免 Python API 与本插件互相读到半个文件
+- 🐞 `onPlayerAuth` 的待处理身份原来放在 `playerAuthCache[0]` 单槽, 多人同时连接会互相覆盖,
+  现按玩家名存放在 `pendingAuthByName`, 60 秒自动过期
+- 🐞 顶层 `MP.RegisterEvent/CreateEventTimer` 没有 pcall, 旧服务端缺 API 时整个插件加载失败
+- 🐞 `b64Decode` 依赖 `bit32` (Lua 5.1/5.2 才有), 部分 5.3 构建直接报错 → 改为纯算术实现
+- 🐞 去掉把 `password_hash` 打到控制台的调试输出
+- 🐞 投票倒计时广播的 `%d` 遇到非数字 target_id 会抛错 → 统一 `tostring` + `math.ceil`
+
+**HTTP API (BMP_HTTP_API.py) 关键修复**
+- 🔒 **提权漏洞**: `--admins` 里的名字可以被匿名注册抢注, 注册完直接拥有管理员权限 → 已改为保留名
+- 🔒 `--allow-ips` 原来只在 POST 生效, 所有 GET 完全绕过 → 已统一
+- 🔒 改密/删号/撤管理员后 **token 不失效** (还能用满 7 天) → 现在立即吊销
+- 🔒 `--data-dir` 漏改 `chat_queue.json` / `admin_audit.jsonl` → Bridge 聊天写进旧目录, 游戏里永远不广播
+- 🔒 TLS 证书错误时静默降级成明文 HTTP → 改为 fail-closed 拒绝启动
+- 🐞 数据文件损坏被当成空库, 下一次注册把 `accounts.json` 覆盖成只剩新账号 → 改为 503 拒绝写入
+- 🐞 `HTTPServer` 单线程 + 无超时, 一个慢连接能卡死整个 API → 改 `ThreadingHTTPServer` + 15s 超时
+- 🐞 JSON body 不是对象 (`[]`、数字字段) 时抛异常且不回包 → 统一 400/500 JSON
+- 🐞 空密码/中文密码: `_lua_hash64` 会 IndexError, 且按码点计算与 Lua 的字节计算不一致 → 中文密码游戏内可登录
+- 🐞 登录成功不清零限速 (key 是 `ip:user` 却用 `user in LOGIN_RATE` 判断) → 正常用户也会被锁
+- 🐞 stdout 被重定向时 banner 里的 emoji 触发 `UnicodeEncodeError`, 进程起不来 → 强制 UTF-8
+- 🐞 超大请求体会连发 413+400 两个响应; 删除管理员时只认 `--admins` 不认持久化 `is_admin`
+
+**管理员后台 (BMP_Admin.py) 关键修复**
+- 🐞 **拉黑发的是截断后的 HWID**: 表格里显示 `beam_id[:40]`, 回读后 `split(":")[-1]` 只剩 7 个字符,
+  存进 banlist 的是个假设备号 (还可能误伤别人) → 改为按 iid 保存完整记录
+- 🐞 「设为管理员」点"否"/关窗 = 降级 → 改为先读当前状态, 取消不发请求
+- 🐞 API 地址输入框只有点「测试」才生效, 其它操作还在打旧服务器 → `trace_add` 实时同步
+- 🐞 自动刷新循环一旦异常就永久停摆; 刷新会清空选中; 打开弹窗时再刷新会 `TclError` → 已修
+- 🐞 错误弹窗显示原始 dict (`{'ok': False, 'error': ...}`) → 统一取 `error`, 401 自动回未登录
+- 🐞 封禁天数输错 (`abc`) 会变成 `0` = 永久封禁 → 校验 0-365
+- 🐞 token 只存 SHA-256 导致自动登录永不生效 → 改为真实持久化
+- 🐞 登出不通知服务端 (token 仍有效) / 双击表头会踢人 / 聊天按钮被挤成 15px
+
+**玩家认证器 (BMPHWID_Bridge.py) 关键修复**
+- 🐞 **"永久机器码"会变**: 指纹里含了 *全部* 网卡 MAC, 装 Hyper-V/WSL2/VPN/USB 网卡就换一个
+  → 账号绑定失效、HWID 封禁形同虚设。现只用 MachineGuid / 主板 UUID,
+  没有稳定源时用"每份安装持久化一次"的兜底 ID; MAC 仅作展示
+- 🐞 本地只存 token hash (无法回读) → 每次启动都未登录; 改为可回读的持久化
+- 🐞 配置文件非原子写 + `except: pass` → 崩溃/无权限时配置静默丢失
+- 🐞 `HTTP://host` 被拼成 `http://HTTP://host`; 地址带路径会变成 `/api/api/...` → 已规范化并拒绝带路径
+- 🐞 服务端 `{ok:false,error:...}` 一律显示成「网络错误: None」; 401 不会清登录态
+- 🐞 登录失败后状态栏仍显示「已登录」; 登出在服务端 `ok:false` 时本地不清状态
+- 🐞 日志面板会打印密码片段和含 `access_token` 的完整响应
+- 🐞 「绑定 HWID」页 `_row` 没推进, 游戏名输入框正好盖住本机 HWID 显示
+- 🐞 玩家列表里的 `(暂无玩家在线)` 占位行可以被当成玩家发起投票
+- 🐞 `api_ping` 任何 200 都亮绿灯 (端口填错也显示连通) → 非 JSON 直接判失败
+- 🐞 `--windowed` 打包后 `sys.stdout is None`, `--cli` 静默无输出 → 改为落盘 `bmphwid_last.json`
 
 ### v3.0.0 (2026-08-27)
 - ✅ 新增管理员后台 BMP_Admin (账号/封禁/聊天/统计 4 个 Tab)

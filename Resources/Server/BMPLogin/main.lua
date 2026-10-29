@@ -1,10 +1,11 @@
 -- ============================================================
--- BMP Login Plugin v2.4.0 (完整管理员版)
+-- BMP Login Plugin v3.1.0 (完整管理员版)
 -- BeamMP Server Player Account Management
+-- 兼容 BeamMP-Server v3.9.0 ~ v3.9.4+
 -- ============================================================
 
 local PLUGIN_NAME = "BMP Login"
-local PLUGIN_VERSION = "2.4.0"
+local PLUGIN_VERSION = "3.1.0"
 local DATA_DIR = "bmp_login"
 local ACCOUNTS_FILE = DATA_DIR .. "/accounts.json"
 local BANLIST_FILE = DATA_DIR .. "/banlist.json"
@@ -18,6 +19,9 @@ local banlist = {}
 local guestAccountMap = {}
 local onlinePlayers = {}
 local playerAuthCache = {}
+-- onPlayerAuth 拿到身份时还没有 playerID, 先按玩家名暂存, onPlayerJoining 再取回
+-- (以前用 playerAuthCache[0] 单槽, 同时多人连接会互相覆盖, 造成身份/封禁判断错乱)
+local pendingAuthByName = {}
 
 -- 投票踢出状态
 local activeVoteKick = nil   -- { target_id, initiator_id, reason, start_time, duration, votes_yes, votes_no, voted_players, last_broadcast }
@@ -78,6 +82,22 @@ local function isArray(t)
     return false
 end
 
+-- 判断 t 是否为"顺序数组" (键恰好是 1..n 的整数)
+-- 必须显式判断: 否则普通 Lua 表 {a,b,c} 在 jsonEncode 里会被当成空对象写成 {},
+-- 导致 banlist.json / kick_queue.json / vote_queue.json 等数据被整体清空
+local function isSequentialArray(t)
+    if type(t) ~= "table" then return false, 0 end
+    local n = 0
+    for k in pairs(t) do
+        if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then return false, 0 end
+        n = n + 1
+    end
+    for i = 1, n do
+        if t[i] == nil then return false, 0 end
+    end
+    return true, n
+end
+
 -- ============================================================
 -- JSON Encode
 -- ============================================================
@@ -107,11 +127,17 @@ local function jsonEncode(val)
             return "[" .. table.concat(parts, ",") .. "]"
         end
         
-        local arr = {}
-        for i = 1, #v do arr[i] = true end
+        -- 未打 Array() 标记的顺序数组也必须编码成 JSON 数组
+        local seq, n = isSequentialArray(v)
+        if seq then
+            local parts = {}
+            for i = 1, n do parts[i] = jsonEncode(v[i]) end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+
         local parts = {}
         for k, val in pairs(v) do
-            if not arr[k] then
+            if type(k) == "string" or type(k) == "number" then
                 parts[#parts + 1] = jsonEncode(tostring(k)) .. ":" .. jsonEncode(val)
             end
         end
@@ -245,6 +271,9 @@ end
 -- Password Hashing
 -- ============================================================
 local function hashPassword(password)
+    -- 空密码会让下面的 (i-1) % pwdLen 变成 % 0 (Lua 5.3 直接报错), 必须挡掉
+    if type(password) ~= "string" or password == "" then return nil end
+
     local salt = ""
     for i = 1, 16 do
         salt = salt .. string.format("%x", math.random(0, 15))
@@ -256,6 +285,7 @@ local function hashPassword(password)
     
     local hash = ""
     local pwdLen = #password
+    if pwdLen == 0 then return nil end
     for i = 1, 64 do
         local idx = ((i - 1) % pwdLen) + 1
         local c = password:byte(idx)
@@ -267,20 +297,20 @@ local function hashPassword(password)
 end
 
 local function verifyPassword(password, storedHash)
+    if type(password) ~= "string" or password == "" then
+        return false
+    end
     if not storedHash or storedHash == "" then
-        print("[BMP Login] verifyPassword: storedHash is empty!")
+        logWarn("verifyPassword: storedHash 为空, 拒绝登录")
         return false
     end
     
     local salt = storedHash:match("^([^:]+):")
     local hash = storedHash:match(":(.+)$")
     if not salt or not hash then
-        print("[BMP Login] verifyPassword: failed to parse salt:hash from stored")
+        logWarn("verifyPassword: 无法从存储值解析出 salt:hash")
         return false
     end
-    
-    print("[BMP Login] verifyPassword: salt=" .. salt .. " (#" .. #salt .. ") hash_len=" .. #hash)
-    print("[BMP Login] verifyPassword: hash=" .. hash)
     
     if #hash > 64 then hash = hash:sub(-64) end
     
@@ -298,9 +328,6 @@ local function verifyPassword(password, storedHash)
         computed = computed .. string.char((c + s + i) % 95 + 32)
     end
     
-    print("[BMP Login] verifyPassword: computed=" .. computed)
-    print("[BMP Login] verifyPassword: match=" .. tostring(computed == hash))
-    
     return computed == hash
 end
 
@@ -316,19 +343,75 @@ local function readJsonFile(filePath)
     return jsonDecode(content)
 end
 
-local function writeJsonFile(filePath, data)
-    -- Ensure directory exists
-    local dir = filePath:match("^(.+)/[^/]+$")
-    if dir and dir ~= "" then
-        pcall(function()
-            os.execute('if not exist "' .. dir .. '" mkdir "' .. dir .. '"')
-        end)
+local function ensureDir(dir)
+    if not dir or dir == "" then return true end
+    local sep = (package.config or "/"):sub(1, 1)
+    if sep == "\\" then
+        -- Windows: cmd 内建 mkdir, 不能直接透传到控制台
+        os.execute('if not exist "' .. dir .. '" mkdir "' .. dir .. '" >NUL 2>NUL')
+    else
+        -- Linux / macOS (BeamMP 服务端最常见的部署环境)
+        os.execute('mkdir -p "' .. dir .. '" 2>/dev/null')
     end
-    local file = io.open(filePath, "w")
-    if not file then return false end
-    file:write(jsonEncode(data))
-    file:close()
     return true
+end
+
+local function writeJsonFile(filePath, data)
+    local dir = filePath:match("^(.+)[/\\][^/\\]+$")
+    if dir and dir ~= "" then
+        ensureDir(dir)
+    end
+
+    local encoded = jsonEncode(data)
+
+    -- 先写 .tmp 再改名, 避免 Python API 与本插件同时读写时读到半个文件
+    local tmp = filePath .. ".tmp"
+    local file = io.open(tmp, "w")
+    if file then
+        file:write(encoded)
+        file:flush()
+        file:close()
+        if os.rename(tmp, filePath) then
+            return true
+        end
+        os.remove(tmp)
+    end
+
+    -- 改名失败 (Windows 上目标已存在或仍被占用) 时退回直接覆盖写
+    local f2 = io.open(filePath, "w")
+    if not f2 then
+        logWarn("writeJsonFile 失败: " .. tostring(filePath))
+        return false
+    end
+    f2:write(encoded)
+    f2:flush()
+    f2:close()
+    return true
+end
+
+-- ============================================================
+-- 服务器单调时间 (BeamMP v3.9.4+ 新 API 适配)
+--   v3.9.4 新增 MP.GetServerTime()   -> 秒 (double, 单调递增)
+--             MP.GetServerTimeMS() -> 毫秒 (uint64)
+--   这两个是 steady_clock 基准的单调时钟, 不受系统时间被手动修改 /
+--   NTP 校时跳变影响, 适合投票倒计时、冷却、轮询节流这类"时长"计算。
+--   ⚠️ 它们不是 epoch 时间戳: 写进 JSON 的时间戳、封禁到期时间仍必须用 os.time()
+--   老版本服务端 (<= v3.9.3) 没有这两个函数, 自动回退到 os.time()
+-- ============================================================
+local HAS_SERVER_TIME = false
+do
+    local ok = pcall(function()
+        HAS_SERVER_TIME = (MP ~= nil) and (type(MP.GetServerTime) == "function")
+    end)
+    if not ok then HAS_SERVER_TIME = false end
+end
+
+local function monotonicNow()
+    if HAS_SERVER_TIME then
+        local ok, v = pcall(function() return MP.GetServerTime() end)
+        if ok and type(v) == "number" then return v end
+    end
+    return os.time()
 end
 
 -- ============================================================
@@ -352,7 +435,7 @@ local function sanitizeChatText(s)
 end
 
 local function processChatQueueInternal()
-    local now = os.time()
+    local now = monotonicNow()
     if now - lastChatQueuePoll < CHAT_QUEUE_INTERVAL then return end
     lastChatQueuePoll = now
 
@@ -483,19 +566,10 @@ local function loadAccounts()
         end
     end
     if repaired > 0 then
-        print("[BMP Login] 已修复 " .. repaired .. " 个账号字段结构 (对象 -> 数组)，立即写回文件")
+        logMsg("已修复 " .. repaired .. " 个账号字段结构 (对象 -> 数组)，立即写回文件")
         -- 直接调 writeJsonFile (此时 saveAccounts 可能还没定义, 避免 nil 错误)
         local ok, err = pcall(writeJsonFile, ACCOUNTS_FILE, accounts)
-        print("[BMP Login] writeJsonFile 结果 ok=" .. tostring(ok) .. " err=" .. tostring(err or "nil"))
-        -- 再 DEBUG：验证写回后 DRIFTKING 两个字段在内存里确实是数组
-        if accounts["DRIFTKING"] then
-            local dk = accounts["DRIFTKING"]
-            local mt_bi = getmetatable(dk.bind_beam_ids)
-            local mt_lr = getmetatable(dk.login_records)
-            print("[BMP Login] DRIFTKING 内存验证: bind_beam_ids(#="..#dk.bind_beam_ids..") mt.tag="..tostring(mt_bi and mt_bi.__tag_json_array).." / login_records(#="..#dk.login_records..") mt.tag="..tostring(mt_lr and mt_lr.__tag_json_array))
-            -- 单独 jsonEncode DRIFTKING 看输出
-            print("[BMP Login] DRIFTKING encode: " .. jsonEncode(dk))
-        end
+        logMsg("writeJsonFile 结果 ok=" .. tostring(ok) .. " err=" .. tostring(err or "nil"))
     end
     local count = 0
     for _ in pairs(accounts) do count = count + 1 end
@@ -539,6 +613,12 @@ end
 -- ============================================================
 -- Player Role
 -- ============================================================
+-- 前置声明: getPlayerStableInfo 的真实实现放在文件后面 (需要 MP.GetPlayerIdentifiers)
+-- 如果不在这里声明成 local, 上面 isPlayerAdmin 里的调用会被编译成全局查找
+-- (_ENV.getPlayerStableInfo == nil), 运行时直接 "attempt to call a nil value",
+-- 导致所有管理员命令和投票踢出全部失效。
+local getPlayerStableInfo
+
 local function getPlayerRole(beamId, playerID)
     if not beamId then return "游客" end
     -- 方法 1: accounts 直接以 beamId 为 key (老格式)
@@ -609,8 +689,9 @@ end
 --   未认证用户: 1 辆 (无稳定身份, 防滥用)
 -- ============================================================
 local VEHICLE_LIMITS = {
-    authenticated = 5,  -- 认证用户
-    unauthenticated = 0, -- 未认证用户 (禁止刷车)
+    admin = 999,          -- 管理员 (与 README / HTTP API 的 999 保持一致)
+    authenticated = 5,    -- 认证用户
+    unauthenticated = 0,  -- 未认证用户 (禁止刷车)
 }
 
 local function isPlayerAuthenticated(playerID)
@@ -640,7 +721,9 @@ end
 
 local function getPlayerVehicleLimit(playerID)
     if not playerID then return VEHICLE_LIMITS.unauthenticated end
-    local beam_id_ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
+    if isPlayerAdmin(playerID) then
+        return VEHICLE_LIMITS.admin
+    end
     if isPlayerAuthenticated(playerID) then
         return VEHICLE_LIMITS.authenticated
     end
@@ -649,7 +732,6 @@ end
 
 local function getPlayerAuthLabel(playerID)
     if not playerID then return "未认证" end
-    local beam_id_ok, beam_id = pcall(function() return getPlayerStableInfo(playerID) end)
     if isPlayerAuthenticated(playerID) then return "认证" end
     return "未认证"
 end
@@ -667,7 +749,7 @@ local playerVehicleCount = {}
 --   P3 = MP.GetPlayerHWID
 --   P4 = fallback: GUEST:xxx / NAME:xxx
 -- ============================================================
-local function getPlayerStableInfo(playerID)
+getPlayerStableInfo = function(playerID)
     local beamId = nil
     local ip = nil
     local name = nil
@@ -753,15 +835,11 @@ local function getPlayerStableInfo(playerID)
     
     parseIds(ids)
     
-    -- Try MP.GetPlayerHWID if exists
+    -- Try MP.GetPlayerHWID if exists (只接受 playerID; 个别构建里没有这个函数)
     if not beamId then
         local ok3, phwid = pcall(function() return MP.GetPlayerHWID(playerID) end)
         if ok3 and phwid and type(phwid) == "string" and phwid ~= "" then
             beamId = "HWID:srv:" .. phwid
-        end
-        local ok4, pname2 = pcall(function() return MP.GetPlayerHWID(name or pname) end)
-        if ok4 and pname2 and type(pname2) == "string" and pname2 ~= "" and not beamId then
-            beamId = "HWID:srv:" .. pname2
         end
     end
     
@@ -829,10 +907,15 @@ local function registerAccount(playerID, username, password)
     
     local beamId = getPlayerStableInfo(playerID)
     local playerName = MP.GetPlayerName(playerID)
+    local pwdHash = hashPassword(password)
+    if not pwdHash then
+        MP.SendChatMessage(playerID, " 错误: 密码无效")
+        return false
+    end
     
     accounts[username] = {
         username = username,
-        password_hash = hashPassword(password),
+        password_hash = pwdHash,
         register_time = os.time(),
         bind_beam_ids = Array({ beamId }),
         login_records = Array({})
@@ -855,9 +938,6 @@ local function loginAccount(playerID, username, password)
     local account = accounts[username]
     
     local storedHash = account.password_hash or ""
-    -- DEBUG: 打印 hash 前 20 字符 + 长度
-    print("[BMP Login] DEBUG verify: user=" .. username .. " hash_len=" .. #storedHash .. " hash_prefix=" .. storedHash:sub(1, 20))
-    
     if not verifyPassword(password, storedHash) then
         MP.SendChatMessage(playerID, " 错误: 密码不正确")
         return false
@@ -1017,10 +1097,10 @@ local function _startVoteKick(initiatorID, targetID, reason)
         return false
     end
     
-    -- 冷却检查
-    local now = os.time()
+    -- 冷却检查 (用单调时钟, 系统时间被改动也不会算错)
+    local now = monotonicNow()
     if voteKickCooldown[initiatorID] and (now - voteKickCooldown[initiatorID]) < 120 then
-        local remain = 120 - (now - voteKickCooldown[initiatorID])
+        local remain = math.ceil(120 - (now - voteKickCooldown[initiatorID]))
         MP.SendChatMessage(initiatorID, " 发起人冷却中, 还需等待 " .. tostring(remain) .. " 秒")
         return false
     end
@@ -1036,7 +1116,7 @@ local function _startVoteKick(initiatorID, targetID, reason)
         votes_yes = 0,
         votes_no = 0,
         voted_players = {},
-        last_broadcast = 0,
+        last_broadcast = now,
     }
     voteKickCooldown[initiatorID] = now
     
@@ -1148,7 +1228,7 @@ end
 local function _checkVoteKickTimeout()
     if not activeVoteKick then return end
     
-    local now = os.time()
+    local now = monotonicNow()
     local elapsed = now - activeVoteKick.start_time
     local remaining = activeVoteKick.duration - elapsed
     
@@ -1162,9 +1242,10 @@ local function _checkVoteKickTimeout()
     if now - activeVoteKick.last_broadcast >= VOTE_KICK_BROADCAST_INTERVAL and remaining > 0 then
         activeVoteKick.last_broadcast = now
         local targetName = _getOnlinePlayerName(activeVoteKick.target_id)
-        local msg = string.format("投票进行中: %s (ID:%d) | 赞成:%d 反对:%d | 剩余:%d秒 | 输入 /vote yes 或 /vote no",
-            tostring(targetName), activeVoteKick.target_id,
-            activeVoteKick.votes_yes, activeVoteKick.votes_no, remaining)
+        local targetID = tonumber(activeVoteKick.target_id) or activeVoteKick.target_id
+        local msg = string.format("投票进行中: %s (ID:%s) | 赞成:%d 反对:%d | 剩余:%d秒 | 输入 /vote yes 或 /vote no",
+            tostring(targetName), tostring(targetID),
+            activeVoteKick.votes_yes, activeVoteKick.votes_no, math.ceil(remaining))
         _broadcastVoteKick(msg)
     end
     
@@ -1181,8 +1262,8 @@ local function _processVoteQueue()
     local content = f:read("*all") or "[]"
     f:close()
     
-    local queue = jsonDecode(content)
-    if type(queue) ~= "table" or #queue == 0 then return end
+    local ok_parse, queue = pcall(jsonDecode, content)
+    if not ok_parse or type(queue) ~= "table" or #queue == 0 then return end
     
     local changed = false
     for _, entry in ipairs(queue) do
@@ -1675,6 +1756,12 @@ function onInit()
     print("[BMP Login] ========================================")
     print("[BMP Login] 事件: onPlayerAuth, onPlayerJoining, onPlayerConnected, onPlayerDisconnect, onChatMessage")
     print("[BMP Login] 数据目录: " .. DATA_DIR)
+    -- BeamMP v3.9.4+ 适配状态
+    if HAS_SERVER_TIME then
+        print("[BMP Login] 时间源: MP.GetServerTime() (BeamMP v3.9.4+ 单调时钟)")
+    else
+        print("[BMP Login] 时间源: os.time() 回退 (服务端 < v3.9.4, 无 MP.GetServerTime)")
+    end
     print("[BMP Login] ========================================")
 end
 
@@ -1768,36 +1855,51 @@ function onPlayerAuth(player_name, role, isGuest, identifiers)
     end
     
     -- Pre-populate auth cache with beam_id from identifiers (before player fully joins)
-    if beamId then
-        playerAuthCache[0] = playerAuthCache[0] or {}
-        playerAuthCache[0].pending_beam_id = beamId
-        playerAuthCache[0].pending_ip = ip
-        playerAuthCache[0].pending_name = player_name
+    if beamId or player_name then
+        local nowTs = os.time()
+        -- 顺手清理残留 (玩家连到一半掉线就不会有人来取回)
+        for nm, v in pairs(pendingAuthByName) do
+            if type(v) ~= "table" or not v.ts or (nowTs - v.ts) > 60 then
+                pendingAuthByName[nm] = nil
+            end
+        end
+        if player_name then
+            pendingAuthByName[player_name] = {
+                beam_id = beamId,
+                ip = ip,
+                ts = nowTs,
+                name = player_name,
+            }
+        end
     end
     
     return true
 end
 
 function onPlayerJoining(playerID)
-    -- [Step 0] Carry over pending data from onPlayerAuth (which runs with no playerID yet)
-    if playerAuthCache[0] and (playerAuthCache[0].pending_beam_id or playerAuthCache[0].pending_name) then
-        local curName = nil
-        local ok, pn = pcall(function() return MP.GetPlayerName(playerID) end)
-        if ok and pn then curName = pn end
-        -- Match via name (onPlayerAuth uses player_name which equals GetPlayerName here)
-        local pending = playerAuthCache[0]
-        if not pending.pending_name or not curName or pending.pending_name == curName then
-            playerAuthCache[playerID] = playerAuthCache[playerID] or {}
-            if pending.pending_beam_id then
-                playerAuthCache[playerID].auth_beam_id = pending.pending_beam_id
-            end
-            if pending.pending_ip then
-                playerAuthCache[playerID].auth_ip = pending.pending_ip
-            end
-            print("[BMP Login] onPlayerJoining(#" .. playerID .. "): 从 onPlayerAuth 携带 pending beam_id=" .. tostring(pending.pending_beam_id) .. " name=" .. tostring(curName))
-            -- Clear global pending so next player doesn't collide
-            playerAuthCache[0] = nil
+    -- [Step 0] 取回 onPlayerAuth 暂存的身份 (onPlayerAuth 阶段还没有 playerID)
+    local ok_pn, curName = pcall(function() return MP.GetPlayerName(playerID) end)
+    if not ok_pn then curName = nil end
+
+    local pending = curName and pendingAuthByName[curName] or nil
+    if not pending then
+        -- 名字对不上 (改名 / 大小写差异): 只有唯一一条暂存时才敢用
+        local only, cnt = nil, 0
+        for _, v in pairs(pendingAuthByName) do cnt = cnt + 1; only = v end
+        if cnt == 1 then pending = only end
+    end
+
+    if pending then
+        playerAuthCache[playerID] = playerAuthCache[playerID] or {}
+        if pending.beam_id then
+            playerAuthCache[playerID].auth_beam_id = pending.beam_id
         end
+        if pending.ip then
+            playerAuthCache[playerID].auth_ip = pending.ip
+        end
+        if pending.name then pendingAuthByName[pending.name] = nil end
+        print("[BMP Login] onPlayerJoining(#" .. tostring(playerID) .. "): 从 onPlayerAuth 携带 pending beam_id="
+            .. tostring(pending.beam_id) .. " name=" .. tostring(curName))
     end
     
     local beamId, ip, name = getPlayerStableInfo(playerID)
@@ -2181,7 +2283,6 @@ end
 
 -- 定时轮询 banlist.json 变化 (每 3 秒) + 检查所有在线玩家
 local BAN_POLL_EVENT = "BMP_BAN_POLL"
-local lastBanMtime = 0
 
 function processBanPollGlobal(eventName)
     local now = os.time()
@@ -2228,8 +2329,15 @@ function processBanPollGlobal(eventName)
     return 0
 end
 
-MP.RegisterEvent(BAN_POLL_EVENT, "processBanPollGlobal")
-MP.CreateEventTimer(BAN_POLL_EVENT, 3000)  -- 每 3 秒
+-- 顶层注册必须 pcall 包住: 老版本服务端若没有 MP.CreateEventTimer,
+-- 未保护的调用会让整个插件 chunk 加载失败 (插件完全不起作用)
+local ok_ban_timer = pcall(function()
+    MP.RegisterEvent(BAN_POLL_EVENT, "processBanPollGlobal")
+    MP.CreateEventTimer(BAN_POLL_EVENT, 3000)  -- 每 3 秒
+end)
+if not ok_ban_timer then
+    logWarn("BAN_POLL 定时器注册失败, 封禁轮询将只在其它事件触发时执行")
+end
 
 -- ============================================================
 -- Vehicle Events (minimal)
@@ -2319,11 +2427,15 @@ local function b64Decode(s)
         local c = s:sub(i, i)
         local val = b64_lookup[c]
         if val then
-            acc = bit32.bor(bit32.lshift(acc, 6), val)
+            -- 纯算术实现: BeamMP 的 Lua 5.3 不一定带 bit32 兼容库,
+            -- 直接调 bit32.bor 会 "attempt to index a nil value (global 'bit32')"
+            acc = acc * 64 + val
             bits = bits + 6
             if bits >= 8 then
                 bits = bits - 8
-                local byte = bit32.rshift(acc, bits) % 256
+                local divisor = 2 ^ bits
+                local byte = math.floor(acc / divisor) % 256
+                acc = acc % divisor
                 out[#out + 1] = string.char(byte)
             end
         end

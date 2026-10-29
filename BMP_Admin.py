@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 import urllib.request, urllib.error
 from datetime import datetime
 
-VERSION = "BMP-Admin/v1.0.0"
+VERSION = "BMP-Admin/v1.1.0"
 CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, 'frozen', False) else __file__)),
     "bmp_admin_config.json"
@@ -49,11 +49,10 @@ def _hash_token(tok):
 
 def _save_cfg():
     try:
-        save_data = dict(CFG)
-        if save_data.get("access_token"):
-            save_data["_token_hash"] = _hash_token(save_data.pop("access_token"))
+        # 直接存 token 明文: 旧实现把 access_token 换成 _token_hash 而 _load_cfg 从不读它,
+        # 等于每次启动都是未登录, 自动登录永远不可能生效
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
+            json.dump(dict(CFG), f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -78,15 +77,27 @@ def api_post(path, body=None, timeout=8):
         req.add_header("Authorization", "Bearer " + token)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return True, json.loads(resp.read())
+            return True, _fill_msg(json.loads(resp.read()))
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read())
-            return False, body
+            if not isinstance(body, dict):
+                body = {"ok": False, "msg": f"HTTP {e.code}"}
         except Exception:
-            return False, {"ok": False, "msg": f"HTTP {e.code}"}
+            body = {"ok": False, "msg": f"HTTP {e.code}"}
+        # 401 必须让界面回到未登录状态, 否则 token 失效后所有操作都在报错
+        if e.code == 401:
+            body["auth_expired"] = True
+        return False, _fill_msg(body)
     except Exception as e:
         return False, {"ok": False, "msg": str(e)}
+
+def _fill_msg(result, fallback="请求失败"):
+    """API 的失败响应是 {ok:false,error:...}, 旧界面只读 msg, 于是弹窗显示原始 dict"""
+    if isinstance(result, dict):
+        if not result.get("msg"):
+            result["msg"] = result.get("error") or fallback
+    return result
 
 def api_get(path, timeout=6):
     base, err = _norm_url(CFG.get("server_url") or "")
@@ -119,8 +130,25 @@ class AdminApp:
 
         _load_cfg()
 
+        # iid -> 完整在线玩家记录 (表格里的 BeamID 是截断显示值, 不能反查)
+        self._online_rows = {}
+        self._accounts = {}
+        self._online_job = None
+
         self._build_ui()
         self._refresh_status()
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
+
+    def _on_close(self):
+        try:
+            if getattr(self, "_online_job", None):
+                self.root.after_cancel(self._online_job)
+        except Exception:
+            pass
+        self.root.destroy()
 
     # ---- UI 构建 ----
     def _build_ui(self):
@@ -137,6 +165,13 @@ class AdminApp:
         tk.Label(top, text="API地址:", bg="#1e293b", fg="#94a3b8",
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(20, 2))
         self.url_var = tk.StringVar(value=CFG.get("server_url", ""))
+        # 旧实现只有 [_do_ping] 才把输入框写回 CFG, 于是改了地址后登录/刷新/封禁
+        # 还在打旧服务器. 这里用 trace 保证任何时刻输入框都同步到 CFG.
+        try:
+            self.url_var.trace_add("write",
+                                   lambda *_: CFG.__setitem__("server_url", self.url_var.get().strip()))
+        except Exception:
+            pass
         url_entry = tk.Entry(top, textvariable=self.url_var, width=30,
                              font=("Consolas", 10), bg="#334155", fg="#e2e8f0",
                              insertbackground="white", relief="flat")
@@ -347,12 +382,12 @@ class AdminApp:
         self.tv_online.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
         vsb.pack(side="left", fill="y", pady=4)
 
-        # 绑定双击踢出
-        self.tv_online.bind("<Double-1>", lambda e: self._kick_selected())
+        # 绑定双击踢出 (只在数据单元格上生效, 双击表头/空白区不应踢人)
+        self.tv_online.bind("<Double-1>", self._on_online_double_click)
 
-        # 操作按钮
+        # 操作按钮 (先 pack 底部按钮栏, 否则列表 expand 后会把它挤掉)
         btn_bar = tk.Frame(frm, bg="#f0f2f5")
-        btn_bar.pack(fill="x", pady=4)
+        btn_bar.pack(side="bottom", fill="x", pady=4)
         tk.Button(btn_bar, text="👢 踢出选中", bg="#ef4444", fg="white",
                   font=("Microsoft YaHei UI", 9), relief="flat", padx=10,
                   command=self._kick_selected).pack(side="left", padx=4)
@@ -363,34 +398,67 @@ class AdminApp:
         # 自动刷新
         self._auto_refresh_online()
 
+    def _on_online_double_click(self, event):
+        if self.tv_online.identify_region(event.x, event.y) != "cell":
+            return
+        self._kick_selected()
+
     def _auto_refresh_online(self):
-        """每 5 秒自动刷新在线列表"""
-        self._refresh_online(silent=True)
-        self.root.after(5000, self._auto_refresh_online)
+        """每 5 秒自动刷新在线列表.
+        定时器必须放在 finally 里: 旧实现一旦某次刷新抛异常, 就再也不排下一次,
+        列表永远停在旧数据 (且旧玩家 ID 仍然可用, 可能踢错人)。"""
+        try:
+            self._refresh_online(silent=True)
+        except Exception:
+            pass
+        finally:
+            try:
+                self._online_job = self.root.after(5000, self._auto_refresh_online)
+            except Exception:
+                self._online_job = None
 
     def _refresh_online(self, silent=False):
         if not self._require_admin(silent=silent): return
         ok, r = api_post("/api/admin/players")
         if not ok or not r.get("ok"):
             if not silent:
-                messagebox.showerror("错误", r.get("msg", str(r)))
+                self._show_error(r)
+            else:
+                # 刷新失败时清空旧数据: BeamMP 会复用 playerID, 留着旧行很容易踢错人
+                for item in self.tv_online.get_children():
+                    self.tv_online.delete(item)
+                self._online_rows = {}
             return
+        # 刷新会重建所有行, 先记住当前选中的 playerID, 重建后恢复
+        keep_pids = set()
+        for iid in self.tv_online.selection():
+            rec = getattr(self, "_online_rows", {}).get(iid)
+            if rec:
+                keep_pids.add(str(rec.get("playerID", "")))
         for item in self.tv_online.get_children():
             self.tv_online.delete(item)
+        self._online_rows = {}
         now = int(time.time())
         for p in r.get("data", []):
+            if not isinstance(p, dict):
+                continue
             pid = p.get("playerID", "")
             name = p.get("name", "")
             role = p.get("role", "")
             auth = "✅" if p.get("is_authenticated") else "❌"
             acct = p.get("bind_account", "")
-            beam_id = p.get("beam_id", "")[:40]
+            beam_id_full = p.get("beam_id", "") or ""
+            beam_id = beam_id_full[:40]      # 仅用于显示
             veh = p.get("vehicle_count", 0)
             jt = p.get("join_time", 0)
             online_min = (now - jt) // 60 if jt else 0
             online_text = f"{online_min}分" if online_min < 60 else f"{online_min // 60}时{online_min % 60}分"
-            self.tv_online.insert("", "end", values=(
+            iid = self.tv_online.insert("", "end", values=(
                 pid, name, role, auth, acct, beam_id, veh, online_text))
+            # 保存完整记录: 表格里的是截断后的 BeamID, 不能反查
+            self._online_rows[iid] = p
+            if str(pid) in keep_pids:
+                self.tv_online.selection_add(iid)
         count = len(r.get("data", []))
         if not silent:
             if count == 0:
@@ -399,50 +467,57 @@ class AdminApp:
                 self._set_status(f"✅ 在线 {count} 人", "#10b981")
 
     def _kick_selected(self):
+        if not self._require_admin():
+            return
         sel = self.tv_online.selection()
         if not sel:
             messagebox.showwarning("提示", "请先选择玩家")
             return
         reason = self.kick_reason.get().strip() or "违规行为"
-        for s in sel:
-            vals = self.tv_online.item(s, "values")
-            pid = int(vals[0])
-            pname = vals[1]
+        # 先快照, 后面弹窗会跑嵌套事件循环, 期间自动刷新可能删掉树里的行
+        rows = [(s, getattr(self, "_online_rows", {}).get(s)) for s in sel]
+        for _s, rec in rows:
+            if not rec:
+                continue
+            pid = rec.get("playerID")
+            pname = rec.get("name", "")
             if not messagebox.askyesno("确认", f"确定要踢出玩家 {pname} (ID={pid})?\n原因: {reason}"):
                 return
             ok, r = api_post("/api/admin/kick", {"playerID": pid, "reason": reason})
             if ok and r.get("ok"):
                 self._set_status(f"✅ {r.get('msg')}", "#10b981")
             else:
-                messagebox.showerror("错误", r.get("msg", str(r)))
+                self._show_error(r)
         self._refresh_online(silent=True)
 
     def _ban_selected(self):
+        if not self._require_admin():
+            return
         sel = self.tv_online.selection()
         if not sel:
             messagebox.showwarning("提示", "请先选择玩家")
             return
-        for s in sel:
-            vals = self.tv_online.item(s, "values")
-            pid = int(vals[0])
-            pname = vals[1]
-            role = vals[2]
-            auth_flag = vals[3]
-            bind_account = vals[4]
-            beam_id = vals[5]
-            
-            is_auth = (auth_flag == "✅")
+        rows = [(s, getattr(self, "_online_rows", {}).get(s)) for s in sel]
+        for _s, rec in rows:
+            if not rec:
+                continue
+            pid = rec.get("playerID")
+            pname = rec.get("name", "")
+            bind_account = rec.get("bind_account") or ""
+            beam_id = rec.get("beam_id") or ""
+            is_auth = bool(rec.get("is_authenticated"))
+
             if is_auth and bind_account:
                 # 认证玩家: 按账号封禁
                 ban_type = "account"
                 ban_value = bind_account
                 ban_desc = f"账号 {bind_account}"
-            elif beam_id and beam_id.startswith("HWID:"):
-                # 有 HWID: 按设备封禁
+            elif beam_id.startswith("HWID:"):
+                # 有 HWID: 按设备封禁 (用完整 BeamID 最后一段, 绝不使用表格里的截断值)
                 ban_type = "hwid"
                 ban_value = beam_id.split(":")[-1] if ":" in beam_id else beam_id
                 ban_desc = f"HWID {ban_value[:20]}..."
-            elif beam_id and beam_id.startswith("IP:"):
+            elif beam_id.startswith("IP:"):
                 # 有 IP: 按 IP 封禁
                 ban_type = "ip"
                 ban_value = beam_id[3:]
@@ -472,7 +547,7 @@ class AdminApp:
             if ok and r.get("ok"):
                 self._set_status(f"✅ {r.get('msg')}", "#10b981")
             else:
-                messagebox.showerror("错误", r.get("msg", str(r)))
+                self._show_error(r)
         self._refresh_online(silent=True)
 
     # ---- Tab 4: 聊天广播 ----
@@ -596,6 +671,25 @@ class AdminApp:
         self.status_label.config(text=text, fg=color)
         self.root.update_idletasks()
 
+    def _show_error(self, r):
+        """统一错误弹窗: API 的失败响应是 {ok:false,error:...}, 旧代码直接用 msg 会显示原始 dict;
+        token 过期 (401) 时还要把界面切回未登录状态, 否则后面每个操作都会继续 401"""
+        r = r if isinstance(r, dict) else {"msg": str(r)}
+        msg = r.get("msg") or r.get("error") or "请求失败"
+        if r.get("auth_expired") or "token" in str(msg) or "未登录" in str(msg):
+            CFG.pop("access_token", None)
+            CFG.pop("username", None)
+            try:
+                _save_cfg()
+            except Exception:
+                pass
+            self.lbl_user.config(text="")
+            self.btn_login.config(text="🔑 管理员登录", bg="#10b981", command=self._do_login)
+            self._set_status("⚠️ 登录已过期, 请重新登录", "#fbbf24")
+            messagebox.showwarning("登录已过期", "管理员登录已失效, 请重新登录")
+            return
+        messagebox.showerror("错误", msg)
+
     def _refresh_status(self):
         url = CFG.get("server_url", "")
         admin = CFG.get("username", "")
@@ -676,15 +770,27 @@ class AdminApp:
     def _do_logout(self):
         if not messagebox.askyesno("确认", "确定要登出吗?"):
             return
+        # 先通知服务器作废 token, 否则本地登出了但 token 还能用满 7 天
+        if CFG.get("access_token"):
+            try:
+                api_post("/api/auth/logout", {})
+            except Exception:
+                pass
         CFG.pop("access_token", None)
         CFG.pop("username", None)
         _save_cfg()
         self.lbl_user.config(text="")
         self.btn_login.config(text="🔑 管理员登录", bg="#10b981", command=self._do_login)
         self._set_status("已登出", "#64748b")
-        for tv in [self.tv_accounts, self.tv_ban, self.tv_chat]:
+        for tv in [self.tv_accounts, self.tv_ban, self.tv_chat, self.tv_online]:
             for item in tv.get_children():
                 tv.delete(item)
+        self._online_rows = {}
+        self._accounts = {}
+        try:
+            self.txt_detail.delete("1.0", "end")
+        except Exception:
+            pass
         self._render_stats_placeholder()
 
     # ---- 登录检查 ----
@@ -701,9 +807,12 @@ class AdminApp:
         self._set_status("加载账号列表...", "#fbbf24")
         ok, r = api_post("/api/admin/accounts")
         if not ok or not r.get("ok"):
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
             self._set_status("❌ 加载失败", "#ef4444")
             return
+        # 缓存一份, 供详情面板和"设为管理员"判断当前状态 (避免每次点选都重新下载)
+        self._accounts = {a["username"]: a for a in r.get("data", [])
+                          if isinstance(a, dict) and "username" in a}
         for item in self.tv_accounts.get_children():
             self.tv_accounts.delete(item)
         for a in r.get("data", []):
@@ -720,14 +829,21 @@ class AdminApp:
         sel = self.tv_accounts.selection()
         if not sel: return
         username = sel[0]
-        ok, r = api_post("/api/admin/accounts")
-        if ok and r.get("ok"):
-            for a in r.get("data", []):
-                if a["username"] == username:
+        a = getattr(self, "_accounts", {}).get(username)
+        if a is None:
+            # 缓存里没有 -> 清空详情, 不要留着上一个账号的绑定信息
+            self.txt_detail.config(state="normal")
+            self.txt_detail.delete("1.0", "end")
+            self.txt_detail.config(state="disabled")
+            return
+        if a is not None:
+            if True:
                     bids = a.get("bind_beam_ids", [])
                     # ---- 按前缀分组 + 去重: GUEST 只留最近一条 ----
                     grouped = {"HWID": [], "IP": [], "GUEST": [], "NAME": []}
                     for b in bids:
+                        if not isinstance(b, str):
+                            continue
                         tag = b.split(":", 1)[0] if ":" in b else "OTHER"
                         if tag in grouped:
                             grouped[tag].append(b)
@@ -768,7 +884,6 @@ class AdminApp:
                     self.txt_detail.delete("1.0", "end")
                     self.txt_detail.insert("1.0", "\n".join(lines))
                     self.txt_detail.config(state="disabled")
-                    break
 
     def _delete_account(self):
         if not self._require_admin(): return
@@ -784,7 +899,7 @@ class AdminApp:
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_accounts()
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     def _reset_password(self):
         if not self._require_admin(): return
@@ -806,7 +921,7 @@ class AdminApp:
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             messagebox.showinfo("成功", r.get("msg"))
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     def _toggle_admin(self):
         if not self._require_admin(): return
@@ -815,15 +930,20 @@ class AdminApp:
             messagebox.showwarning("提示", "请先选择一个账号")
             return
         username = sel[0]
-        is_admin = messagebox.askyesno("设为管理员",
-                                        f"将 {username} 设为管理员?\n(管理员可管理服务器账号)")
+        # 旧实现把 askyesno 的返回值当成"新的管理员状态"发出去,
+        # 于是点"否"/直接关窗都会把管理员降级. 这里必须先读出当前状态.
+        current = bool((getattr(self, "_accounts", {}).get(username) or {}).get("is_admin"))
+        action = "取消" if current else "设为"
+        if not messagebox.askyesno("管理员权限",
+                                   f"确定要将 {username} {action}管理员吗?\n(管理员可管理服务器账号)"):
+            return
         ok, r = api_post("/api/admin/accounts/toggle-admin",
-                          {"username": username, "is_admin": is_admin})
+                          {"username": username, "is_admin": not current})
         if ok and r.get("ok"):
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_accounts()
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     def _unbind_hwid(self):
         if not self._require_admin(): return
@@ -873,7 +993,7 @@ class AdminApp:
                 win.destroy()
                 self._refresh_accounts()
             else:
-                messagebox.showerror("错误", r2.get("msg", str(r2)))
+                self._show_error(r2)
 
         tk.Button(win, text="🔗 解绑选中", bg="#06b6d4", fg="white",
                   font=("Microsoft YaHei UI", 10, "bold"), relief="flat", padx=15,
@@ -885,7 +1005,7 @@ class AdminApp:
         self._set_status("加载封禁列表...", "#fbbf24")
         ok, r = api_post("/api/admin/banlist")
         if not ok or not r.get("ok"):
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
             return
         for item in self.tv_ban.get_children():
             self.tv_ban.delete(item)
@@ -919,10 +1039,16 @@ class AdminApp:
         t = self.ban_type.get()
         v = self.ban_val.get().strip()
         reason = self.ban_reason.get().strip()
+        raw_days = self.ban_days.get().strip() or "0"
         try:
-            days = int(self.ban_days.get().strip() or "0")
+            days = int(raw_days)
         except ValueError:
-            days = 0
+            # 旧实现 except 里 days=0, 而 API 把 0 当"永久封禁" —— 打错字就变永久封号
+            messagebox.showwarning("提示", "封禁天数必须是 0-365 的整数 (0 = 永久)")
+            return
+        if days < 0 or days > 365:
+            messagebox.showwarning("提示", "封禁天数必须是 0-365 的整数 (0 = 永久)")
+            return
         if not v:
             messagebox.showwarning("提示", "请填写封禁值")
             return
@@ -936,7 +1062,7 @@ class AdminApp:
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_ban()
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     def _do_unban(self):
         if not self._require_admin(): return
@@ -949,7 +1075,7 @@ class AdminApp:
             ok, r = api_post("/api/admin/unban",
                               {"type": vals[0], "value": vals[1]})
             if not ok or not r.get("ok"):
-                messagebox.showerror("错误", r.get("msg", str(r)))
+                self._show_error(r)
                 return
         self._set_status("✅ 解封成功", "#10b981")
         self._refresh_ban()
@@ -959,7 +1085,7 @@ class AdminApp:
         if not self._require_admin(): return
         ok, r = api_post("/api/admin/chat-queue")
         if not ok or not r.get("ok"):
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
             return
         for item in self.tv_chat.get_children():
             self.tv_chat.delete(item)
@@ -993,7 +1119,7 @@ class AdminApp:
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_chat()
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     def _clear_chat(self, only_sent):
         if not self._require_admin(): return
@@ -1005,7 +1131,7 @@ class AdminApp:
             self._set_status(f"✅ {r.get('msg')}", "#10b981")
             self._refresh_chat()
         else:
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
 
     # ---- 统计 ----
     def _refresh_stats(self):
@@ -1013,7 +1139,7 @@ class AdminApp:
         self._set_status("加载统计...", "#fbbf24")
         ok, r = api_post("/api/admin/stats")
         if not ok or not r.get("ok"):
-            messagebox.showerror("错误", r.get("msg", str(r)))
+            self._show_error(r)
             return
         self._update_stats(r.get("data", {}))
         self._set_status("✅ 统计已更新", "#10b981")
