@@ -215,6 +215,23 @@ main.lua  玩家进服/离服/每 3 秒  -->  online_players.json
 > 想恢复实时地图时在 `_saveOnlinePlayers()` 里把 `data.pos` 加回来、
 > 并在 `_players_live()` 里把 `pos` 字段放出去即可。
 
+### 不开游戏也能先验证
+
+仓库里带了两个演示脚本：
+
+```powershell
+# 造几个假的在线玩家 (每 3 秒刷新)
+python tools\demo_players.py --data-dir bmp_login
+
+# 冒充本机 Bridge, 让注册页的"读取本机"能点到东西
+python tools\fake_bridge.py 000003e9-1111-4222-8333-00000078f487
+```
+
+然后打开 `http://127.0.0.1:12124/`（在线人数）和 `http://127.0.0.1:12124/account`
+（注册 / 登录 / 聊天）就能看到完整效果。
+
+> 演示脚本只用于本地验证；正式服务器不需要它们（数据来自游戏里的 Lua 插件）。
+
 ---
 
 ## 🔒 安全措施
